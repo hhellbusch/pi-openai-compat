@@ -53,17 +53,38 @@ async function discoverModels(baseUrl: string): Promise<OpenAIModelEntry[]> {
 	return entries.filter((m) => m.id && m.id.length > 0);
 }
 
+/**
+ * Sanitize a model ID for use in pi's "provider/modelId" namespace.
+ * Ramalama uses paths like "library/qwen2.5-coder" as IDs; the embedded
+ * slash confuses pi's provider/model parsing and breaks --models glob
+ * matching (minimatch's * does not cross path separators).
+ */
+function sanitizeModelId(id: string): string {
+	return id.replace(/\//g, "--");
+}
+
 function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 	const contextWindow = entry.meta?.n_ctx_train ?? 32768;
+	const sanitizedId = sanitizeModelId(entry.id);
 
 	return {
-		id: entry.id,
-		name: entry.id,
+		id: sanitizedId,
+		name: entry.id, // keep the original as the human-readable name
 		reasoning: false,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow,
 		maxTokens: Math.min(4096, contextWindow),
+		compat: {
+			// llama.cpp / ramalama speak the older OpenAI field name
+			maxTokensField: "max_tokens",
+			// llama.cpp does not accept the "developer" system-prompt role
+			supportsDeveloperRole: false,
+			// llama.cpp does not support reasoning_effort
+			supportsReasoningEffort: false,
+			// llama.cpp does not support stream_options.include_usage
+			supportsUsageInStreaming: false,
+		},
 	};
 }
 
