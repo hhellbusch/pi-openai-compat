@@ -54,31 +54,37 @@ async function discoverModels(baseUrl: string): Promise<OpenAIModelEntry[]> {
 }
 
 /**
- * Sanitize a model ID for use in pi's "provider/modelId" namespace.
- * Ramalama uses paths like "library/qwen2.5-coder" as IDs; the embedded
- * slash confuses pi's provider/model parsing and breaks --models glob
- * matching (minimatch's * does not cross path separators).
+ * Derive the model ID to register with pi from a raw ramalama/llama.cpp entry.
+ *
+ * ramalama prefixes model IDs with a registry namespace, e.g.
+ * "library/qwen2.5-coder". That embedded '/' creates a 3-segment pi model
+ * reference ("openai-compat/library/qwen2.5-coder") which breaks the
+ * --models glob "openai-compat/*" (minimatch's * does not cross '/').
+ *
+ * ramalama also accepts the bare basename in chat/completions requests, so
+ * we register just the basename as the id and use the full original as the
+ * display name.
  */
-function sanitizeModelId(id: string): string {
-	return id.replace(/\//g, "--");
+function resolveModelId(entry: OpenAIModelEntry): string {
+	const slashIdx = entry.id.lastIndexOf("/");
+	return slashIdx !== -1 ? entry.id.slice(slashIdx + 1) : entry.id;
 }
 
 function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 	const contextWindow = entry.meta?.n_ctx_train ?? 32768;
-	const sanitizedId = sanitizeModelId(entry.id);
 
 	return {
-		id: sanitizedId,
-		name: entry.id, // keep the original as the human-readable name
+		id: resolveModelId(entry),   // "qwen2.5-coder" — API accepts this
+		name: entry.id,              // "library/qwen2.5-coder" — shown in /model
 		reasoning: false,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow,
 		maxTokens: Math.min(4096, contextWindow),
 		compat: {
-			// llama.cpp / ramalama speak the older OpenAI field name
+			// llama.cpp uses max_tokens, not max_completion_tokens
 			maxTokensField: "max_tokens",
-			// llama.cpp does not accept the "developer" system-prompt role
+			// llama.cpp rejects the "developer" system-prompt role
 			supportsDeveloperRole: false,
 			// llama.cpp does not support reasoning_effort
 			supportsReasoningEffort: false,
