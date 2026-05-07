@@ -8,15 +8,52 @@ const PROVIDER_NAME = "openai-compat";
 interface OpenAIModelEntry {
 	id: string;
 	owned_by?: string;
+	// llama.cpp fields
 	meta?: {
 		n_ctx_train?: number;
 	};
+	// LiteLLM / OpenAI-compatible fields (may be present on /v1/models)
+	max_tokens?: number;
+	max_input_tokens?: number;
+	context_window?: number;
+	// Merged in from LiteLLM /model/info
+	supportsVision?: boolean;
+}
+
+// LiteLLM-specific /model/info response shape
+interface LiteLLMModelInfo {
+	model_name: string;
+	model_info?: {
+		max_tokens?: number | null;
+		max_input_tokens?: number | null;
+		supports_vision?: boolean | null;
+	};
+}
+
+interface LiteLLMModelInfoResponse {
+	data?: LiteLLMModelInfo[];
 }
 
 interface OpenAIModelsResponse {
 	data?: OpenAIModelEntry[];
 	models?: OpenAIModelEntry[];
 }
+
+// Known context windows for common models — fallback when the API is silent.
+const KNOWN_CONTEXT_WINDOWS: Array<[RegExp, number]> = [
+	[/qwen3/i, 131072],
+	[/qwq-32b/i, 131072],
+	[/deepseek-r1/i, 131072],
+];
+
+// Known reasoning/thinking model ID patterns (case-insensitive).
+// LiteLLM's supports_reasoning field is unreliable (often null), so we detect by name.
+const REASONING_MODEL_PATTERNS = [
+	/qwen3/i,
+	/qwq/i,
+	/deepseek-r1/i,
+	/deepseek-reasoner/i,
+];
 
 function resolveBaseUrl(): string | undefined {
 	return (
@@ -32,25 +69,62 @@ function resolveApiKey(): string | undefined {
 	);
 }
 
-async function discoverModels(baseUrl: string): Promise<OpenAIModelEntry[]> {
-	const modelsUrl = baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "") + "/v1/models";
+async function fetchJson<T>(url: string, headers: Record<string, string>): Promise<T | null> {
+	try {
+		const response = await fetch(url, {
+			signal: AbortSignal.timeout(5000),
+			headers,
+		});
+		if (!response.ok) return null;
+		return (await response.json()) as T;
+	} catch {
+		return null;
+	}
+}
 
-	const response = await fetch(modelsUrl, {
-		signal: AbortSignal.timeout(5000),
-		headers: {
-			Accept: "application/json",
-		},
-	});
-
-	if (!response.ok) {
-		throw new Error(`${response.status} ${response.statusText}`);
+async function discoverModels(baseUrl: string, apiKey?: string): Promise<OpenAIModelEntry[]> {
+	const base = baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
+	const headers: Record<string, string> = { Accept: "application/json" };
+	if (apiKey) {
+		headers["Authorization"] = `Bearer ${apiKey}`;
 	}
 
-	const body = (await response.json()) as OpenAIModelsResponse;
+	// Primary: standard OpenAI /v1/models
+	const modelsBody = await fetchJson<OpenAIModelsResponse>(`${base}/v1/models`, headers);
+	if (!modelsBody) {
+		throw new Error("Failed to fetch /v1/models");
+	}
 
 	// llama.cpp returns both .data (OpenAI standard) and .models (legacy)
-	const entries = body.data ?? body.models ?? [];
-	return entries.filter((m) => m.id && m.id.length > 0);
+	const entries = (modelsBody.data ?? modelsBody.models ?? [])
+		.filter((m) => m.id && m.id.length > 0);
+
+	// Secondary: LiteLLM /model/info for richer metadata (context window, vision).
+	// Non-fatal — plain OpenAI/llama.cpp endpoints without this route are unaffected.
+	const infoBody = await fetchJson<LiteLLMModelInfoResponse>(`${base}/model/info`, headers);
+	if (infoBody?.data) {
+		const infoByName = new Map<string, LiteLLMModelInfo>();
+		for (const item of infoBody.data) {
+			infoByName.set(item.model_name, item);
+		}
+		for (const entry of entries) {
+			const info = infoByName.get(entry.id);
+			if (!info?.model_info) continue;
+			const mi = info.model_info;
+			// max_tokens on model_info is the context window (LiteLLM convention)
+			if (mi.max_tokens != null && mi.max_tokens > 0) {
+				entry.context_window = mi.max_tokens;
+			}
+			if (mi.max_input_tokens != null && mi.max_input_tokens > 0) {
+				entry.max_input_tokens = mi.max_input_tokens;
+			}
+			if (mi.supports_vision != null) {
+				entry.supportsVision = mi.supports_vision;
+			}
+		}
+	}
+
+	return entries;
 }
 
 /**
@@ -70,17 +144,47 @@ function resolveModelId(entry: OpenAIModelEntry): string {
 	return slashIdx !== -1 ? entry.id.slice(slashIdx + 1) : entry.id;
 }
 
+function isReasoningModel(modelId: string): boolean {
+	return REASONING_MODEL_PATTERNS.some((pattern) => pattern.test(modelId));
+}
+
+function resolveContextWindow(entry: OpenAIModelEntry): number {
+	// Prefer API-reported values (first non-zero wins)
+	const fromApi =
+		entry.context_window ||
+		entry.max_input_tokens ||
+		entry.max_tokens ||
+		entry.meta?.n_ctx_train;
+	if (fromApi && fromApi > 0) return fromApi;
+
+	// Fall back to known-model table
+	for (const [pattern, size] of KNOWN_CONTEXT_WINDOWS) {
+		if (pattern.test(entry.id)) return size;
+	}
+
+	return 32768;
+}
+
 function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
-	const contextWindow = entry.meta?.n_ctx_train ?? 32768;
+	const contextWindow = resolveContextWindow(entry);
+	const reasoning = isReasoningModel(entry.id);
+	// Reasoning models need more output headroom for thinking traces.
+	const maxTokens = reasoning
+		? Math.min(16384, contextWindow)
+		: Math.min(4096, contextWindow);
+
+	const input: ProviderModelConfig["input"] = entry.supportsVision
+		? ["text", "image"]
+		: ["text"];
 
 	return {
-		id: resolveModelId(entry),   // "qwen2.5-coder" — API accepts this
-		name: entry.id,              // "library/qwen2.5-coder" — shown in /model
-		reasoning: false,
-		input: ["text"],
+		id: resolveModelId(entry),  // strips ramalama namespace prefix if present
+		name: entry.id,             // full original ID shown in model picker
+		reasoning,
+		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow,
-		maxTokens: Math.min(4096, contextWindow),
+		maxTokens,
 		compat: {
 			// llama.cpp uses max_tokens, not max_completion_tokens
 			maxTokensField: "max_tokens",
@@ -105,7 +209,7 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 
 	let models: ProviderModelConfig[];
 	try {
-		const entries = await discoverModels(baseUrl);
+		const entries = await discoverModels(baseUrl, apiKey ?? "no-key");
 		models = entries.map(toProviderModel);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
