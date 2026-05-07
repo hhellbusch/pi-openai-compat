@@ -194,6 +194,9 @@ function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 			supportsReasoningEffort: false,
 			// llama.cpp does not support stream_options.include_usage
 			supportsUsageInStreaming: false,
+			// Qwen3 on vLLM requires chat_template_kwargs: {enable_thinking: true}
+			// to activate the reasoning chain. Non-Qwen models leave this unset.
+			...(reasoning ? { thinkingFormat: "qwen-chat-template" } : {}),
 		},
 	};
 }
