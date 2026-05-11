@@ -1,7 +1,7 @@
 import type {
 	ExtensionAPI,
 	ProviderModelConfig,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_NAME = "openai-compat";
 
