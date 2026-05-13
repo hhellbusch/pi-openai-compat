@@ -56,6 +56,10 @@ const REASONING_MODEL_PATTERNS = [
 	/deepseek-reasoner/i,
 ];
 
+// LiteLLM supports stream_options.include_usage; llama.cpp does not.
+// Default: enabled. Set OPENAI_COMPAT_NO_STREAMING_USAGE=1 for llama.cpp backends.
+const STREAMING_USAGE_ENABLED = process.env.OPENAI_COMPAT_NO_STREAMING_USAGE !== "1";
+
 function resolveBaseUrl(): string | undefined {
 	return (
 		process.env.OPENAI_COMPAT_BASE_URL ??
@@ -193,8 +197,9 @@ function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 			supportsDeveloperRole: false,
 			// llama.cpp does not support reasoning_effort
 			supportsReasoningEffort: false,
-			// llama.cpp does not support stream_options.include_usage
-			supportsUsageInStreaming: false,
+			// LiteLLM supports stream_options.include_usage (enables context tracking).
+			// Set OPENAI_COMPAT_NO_STREAMING_USAGE=1 to disable for llama.cpp backends.
+			supportsUsageInStreaming: STREAMING_USAGE_ENABLED,
 			// Qwen3 on vLLM requires chat_template_kwargs: {enable_thinking: true}
 			// to activate the reasoning chain. Non-Qwen models leave this unset.
 			...(reasoning ? { thinkingFormat: "qwen-chat-template" } : {}),
@@ -203,7 +208,7 @@ function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Quota state — updated from response headers on every openai-compat call
+// Footer state — quota + session stats shown in Pi status bar
 // ---------------------------------------------------------------------------
 
 interface QuotaState {
@@ -219,6 +224,15 @@ interface QuotaState {
 	limit: number | null;
 }
 
+interface SessionStats {
+	/** Finish reason from last completed assistant message. */
+	finishReason: string | null;
+	/** Prompt tokens used in last turn (from usage). */
+	contextUsed: number | null;
+	/** Model context window size. */
+	contextWindow: number | null;
+}
+
 const quota: QuotaState = {
 	isLimited: false,
 	resetAt: null,
@@ -227,7 +241,26 @@ const quota: QuotaState = {
 	limit: null,
 };
 
-const STATUS_KEY = "openai-compat-quota";
+const session: SessionStats = {
+	finishReason: null,
+	contextUsed: null,
+	contextWindow: null,
+};
+
+const QUOTA_STATUS_KEY = "openai-compat-quota";
+const SESSION_STATUS_KEY = "openai-compat-session";
+
+// Finish reason display: icon + label + colour
+const FINISH_REASON_MAP: Record<string, { icon: string; label: string; color: string }> = {
+	end_turn:      { icon: "⏹",  label: "done",       color: "dim" },
+	stop:          { icon: "⏹",  label: "done",       color: "dim" },
+	stop_sequence: { icon: "⏹",  label: "stop_seq",   color: "dim" },
+	max_tokens:    { icon: "✂",  label: "max_tokens", color: "warning" },
+	length:        { icon: "✂",  label: "max_tokens", color: "warning" },
+	tool_use:      { icon: "🔧", label: "tool",       color: "dim" },
+	tool_calls:    { icon: "🔧", label: "tool",       color: "dim" },
+	error:         { icon: "⚠",  label: "error",      color: "error" },
+};
 
 function fmtTokens(n: number): string {
 	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -243,7 +276,7 @@ function fmtResetTime(resetAt: string): string {
 
 function updateQuotaStatus(ctx: ExtensionContext): void {
 	if (ctx.model?.provider !== PROVIDER_NAME) {
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+		ctx.ui.setStatus(QUOTA_STATUS_KEY, undefined);
 		return;
 	}
 
@@ -253,7 +286,7 @@ function updateQuotaStatus(ctx: ExtensionContext): void {
 			: quota.retryAfterSecs
 				? `retry in ${quota.retryAfterSecs}s`
 				: "rate limited";
-		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("error", `⛔ ${reset}`));
+		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg("error", `⛔ ${reset}`));
 		return;
 	}
 
@@ -261,11 +294,51 @@ function updateQuotaStatus(ctx: ExtensionContext): void {
 		const pct = quota.remaining / quota.limit;
 		const color = pct < 0.10 ? "error" : pct < 0.25 ? "warning" : "dim";
 		const label = `🪙 ${fmtTokens(quota.remaining)}/${fmtTokens(quota.limit)} tkn`;
-		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(color, label));
+		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg(color, label));
 		return;
 	}
 
-	ctx.ui.setStatus(STATUS_KEY, undefined);
+	ctx.ui.setStatus(QUOTA_STATUS_KEY, undefined);
+}
+
+function updateSessionStatus(ctx: ExtensionContext): void {
+	if (ctx.model?.provider !== PROVIDER_NAME) {
+		ctx.ui.setStatus(SESSION_STATUS_KEY, undefined);
+		return;
+	}
+
+	const parts: string[] = [];
+
+	// Context usage: e.g. "42K/131K ctx"
+	if (session.contextUsed !== null && session.contextWindow !== null && session.contextWindow > 0) {
+		const pct = session.contextUsed / session.contextWindow;
+		const color = pct > 0.85 ? "error" : pct > 0.65 ? "warning" : "dim";
+		parts.push(ctx.ui.theme.fg(color,
+			`${fmtTokens(session.contextUsed)}/${fmtTokens(session.contextWindow)} ctx`
+		));
+	}
+
+	// Finish reason: e.g. "✂ max_tokens" or "⏹ done"
+	if (session.finishReason) {
+		const def = FINISH_REASON_MAP[session.finishReason] ?? {
+			icon: "?", label: session.finishReason, color: "dim",
+		};
+		parts.push(ctx.ui.theme.fg(def.color, `${def.icon} ${def.label}`));
+	}
+
+	if (parts.length > 0) {
+		ctx.ui.setStatus(SESSION_STATUS_KEY,
+			parts.join(ctx.ui.theme.fg("dim", "  "))
+		);
+	} else {
+		ctx.ui.setStatus(SESSION_STATUS_KEY, undefined);
+	}
+}
+
+function resetSessionStats(): void {
+	session.finishReason = null;
+	session.contextUsed = null;
+	session.contextWindow = null;
 }
 
 export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<void> {
@@ -302,8 +375,7 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 	});
 
 	// -------------------------------------------------------------------------
-	// Quota monitoring — read rate limit headers from every response and
-	// display remaining tokens in the Pi status bar when on this provider.
+	// Quota monitoring — rate limit headers → quota status slot
 	// -------------------------------------------------------------------------
 
 	pi.on("after_provider_response", (event, ctx) => {
@@ -313,7 +385,6 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 
 		if (event.status === 429) {
 			quota.isLimited = true;
-			// LiteLLM returns Reset_at (normalized to reset_at)
 			quota.resetAt = h["reset_at"] ?? null;
 			const retryRaw = h["retry-after"];
 			quota.retryAfterSecs = retryRaw ? parseInt(retryRaw, 10) : null;
@@ -322,11 +393,11 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 			quota.isLimited = false;
 			quota.resetAt = null;
 			quota.retryAfterSecs = null;
-			// User-level limits are what hit 429 — prefer those over pool limits
+			// User-level limits are what trigger 429 — prefer those over pool limits
 			const userRemaining = h["x-ratelimit-user-remaining-tokens"];
-			const userLimit = h["x-ratelimit-user-limit-tokens"];
+			const userLimit     = h["x-ratelimit-user-limit-tokens"];
 			const poolRemaining = h["x-ratelimit-remaining-tokens"];
-			const poolLimit = h["x-ratelimit-limit-tokens"];
+			const poolLimit     = h["x-ratelimit-limit-tokens"];
 			quota.remaining = userRemaining !== undefined
 				? parseInt(userRemaining, 10)
 				: poolRemaining !== undefined ? parseInt(poolRemaining, 10) : null;
@@ -338,13 +409,43 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 		updateQuotaStatus(ctx);
 	});
 
-	// Update status bar when model switches (to show/hide quota for this provider)
-	pi.on("model_select", (_event, ctx) => {
-		updateQuotaStatus(ctx);
+	// -------------------------------------------------------------------------
+	// Session stats — finish reason + context usage → session status slot
+	// -------------------------------------------------------------------------
+
+	pi.on("message_end", async (event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_NAME) return;
+		if (event.message.role !== "assistant") return;
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const msg = event.message as any;
+
+		// Finish reason — Pi maps OpenAI finish_reason to Anthropic stop_reason internally
+		const reason = msg.stop_reason ?? msg.stopReason ?? msg.finish_reason ?? null;
+		if (reason) session.finishReason = String(reason);
+
+		// Context usage — populated by Pi when supportsUsageInStreaming is true
+		const usage = ctx.getContextUsage();
+		if (usage?.tokens) {
+			session.contextUsed = usage.tokens;
+			session.contextWindow = ctx.model?.contextWindow ?? null;
+		}
+
+		updateSessionStatus(ctx);
 	});
 
-	// Initialise status bar at session start (in case this is the default model)
-	pi.on("session_start", async (_event, ctx) => {
+	// -------------------------------------------------------------------------
+	// Shared lifecycle hooks
+	// -------------------------------------------------------------------------
+
+	pi.on("model_select", (_event, ctx) => {
 		updateQuotaStatus(ctx);
+		updateSessionStatus(ctx);
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		resetSessionStats();
+		updateQuotaStatus(ctx);
+		updateSessionStatus(ctx);
 	});
 }
