@@ -1,5 +1,6 @@
 import type {
 	ExtensionAPI,
+	ExtensionContext,
 	ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 
@@ -201,6 +202,72 @@ function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 	};
 }
 
+// ---------------------------------------------------------------------------
+// Quota state — updated from response headers on every openai-compat call
+// ---------------------------------------------------------------------------
+
+interface QuotaState {
+	/** True when a 429 has been received and not yet cleared by a 200. */
+	isLimited: boolean;
+	/** Reset timestamp from Reset_at header (e.g. "2026-05-13 00:57:30 UTC"). */
+	resetAt: string | null;
+	/** Retry-After seconds from 429 response. */
+	retryAfterSecs: number | null;
+	/** Remaining user-level tokens from X-Ratelimit-User-Remaining-Tokens. */
+	remaining: number | null;
+	/** User-level token limit from X-Ratelimit-User-Limit-Tokens. */
+	limit: number | null;
+}
+
+const quota: QuotaState = {
+	isLimited: false,
+	resetAt: null,
+	retryAfterSecs: null,
+	remaining: null,
+	limit: null,
+};
+
+const STATUS_KEY = "openai-compat-quota";
+
+function fmtTokens(n: number): string {
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+	if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+	return String(n);
+}
+
+function fmtResetTime(resetAt: string): string {
+	// "2026-05-13 00:57:30 UTC" → "00:57 UTC"
+	const m = resetAt.match(/(\d{2}:\d{2}):\d{2} (UTC)/i);
+	return m ? `${m[1]} ${m[2]}` : resetAt;
+}
+
+function updateQuotaStatus(ctx: ExtensionContext): void {
+	if (ctx.model?.provider !== PROVIDER_NAME) {
+		ctx.ui.setStatus(STATUS_KEY, undefined);
+		return;
+	}
+
+	if (quota.isLimited) {
+		const reset = quota.resetAt
+			? `reset ${fmtResetTime(quota.resetAt)}`
+			: quota.retryAfterSecs
+				? `retry in ${quota.retryAfterSecs}s`
+				: "rate limited";
+		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("error", `⛔ ${reset}`));
+		return;
+	}
+
+	if (quota.remaining !== null && quota.limit !== null && quota.limit > 0) {
+		const pct = quota.remaining / quota.limit;
+		const color = pct < 0.10 ? "error" : pct < 0.25 ? "warning" : "dim";
+		const label = `🪙 ${fmtTokens(quota.remaining)}/${fmtTokens(quota.limit)} tkn`;
+		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(color, label));
+		return;
+	}
+
+	ctx.ui.setStatus(STATUS_KEY, undefined);
+}
+
 export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<void> {
 	const baseUrl = resolveBaseUrl();
 	const apiKey = resolveApiKey();
@@ -232,5 +299,52 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 		apiKey: apiKey ?? "no-key",
 		authHeader: true,
 		models,
+	});
+
+	// -------------------------------------------------------------------------
+	// Quota monitoring — read rate limit headers from every response and
+	// display remaining tokens in the Pi status bar when on this provider.
+	// -------------------------------------------------------------------------
+
+	pi.on("after_provider_response", (event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_NAME) return;
+
+		const h = event.headers;
+
+		if (event.status === 429) {
+			quota.isLimited = true;
+			// LiteLLM returns Reset_at (normalized to reset_at)
+			quota.resetAt = h["reset_at"] ?? null;
+			const retryRaw = h["retry-after"];
+			quota.retryAfterSecs = retryRaw ? parseInt(retryRaw, 10) : null;
+			quota.remaining = 0;
+		} else if (event.status === 200) {
+			quota.isLimited = false;
+			quota.resetAt = null;
+			quota.retryAfterSecs = null;
+			// User-level limits are what hit 429 — prefer those over pool limits
+			const userRemaining = h["x-ratelimit-user-remaining-tokens"];
+			const userLimit = h["x-ratelimit-user-limit-tokens"];
+			const poolRemaining = h["x-ratelimit-remaining-tokens"];
+			const poolLimit = h["x-ratelimit-limit-tokens"];
+			quota.remaining = userRemaining !== undefined
+				? parseInt(userRemaining, 10)
+				: poolRemaining !== undefined ? parseInt(poolRemaining, 10) : null;
+			quota.limit = userLimit !== undefined
+				? parseInt(userLimit, 10)
+				: poolLimit !== undefined ? parseInt(poolLimit, 10) : null;
+		}
+
+		updateQuotaStatus(ctx);
+	});
+
+	// Update status bar when model switches (to show/hide quota for this provider)
+	pi.on("model_select", (_event, ctx) => {
+		updateQuotaStatus(ctx);
+	});
+
+	// Initialise status bar at session start (in case this is the default model)
+	pi.on("session_start", async (_event, ctx) => {
+		updateQuotaStatus(ctx);
 	});
 }
