@@ -295,7 +295,7 @@ function updateQuotaStatus(ctx: ExtensionContext): void {
 	if (quota.remaining !== null && quota.limit !== null && quota.limit > 0) {
 		const pct = quota.remaining / quota.limit;
 		const color = (pct < 0.10 ? "error" : pct < 0.25 ? "warning" : "dim") as ThemeColor;
-		const label = `🪙 ${fmtTokens(quota.remaining)}/${fmtTokens(quota.limit)} tkn`;
+		const label = `tkn: ${fmtTokens(quota.remaining)}/${fmtTokens(quota.limit)}`;
 		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg(color, label));
 		return;
 	}
@@ -431,6 +431,60 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 		apiKey: apiKey ?? "no-key",
 		authHeader: true,
 		models,
+	});
+
+	// -------------------------------------------------------------------------
+	// Proactive quota poll — fetch /user/info at session start
+	//
+	// The rate-limit headers on 200 responses update the quota slot reactively,
+	// but only after the first request. LiteLLM's /user/info endpoint returns
+	// the current budget state — poll it on session_start so the status slot
+	// shows remaining tokens before any request is made.
+	// -------------------------------------------------------------------------
+
+	pi.on("session_start", async (_event, ctx) => {
+		const infoUrl = baseUrl.replace(/\/v1\/?$/, "") + "/user/info";
+		try {
+			const headers: Record<string, string> = {
+				"Content-Type": "application/json",
+			};
+			if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+			const resp = await fetch(infoUrl, { headers });
+			if (!resp.ok) return;
+
+			const data = await resp.json() as {
+				keys?: Array<{
+					token_budget_duration?: string | null;
+					max_budget?: number | null;
+					spend?: number | null;
+					tpm_limit?: number | null;
+					rpm_limit?: number | null;
+				}>;
+				teams?: Array<{
+					tpm_limit?: number | null;
+					max_budget?: number | null;
+					spend?: number | null;
+				}>;
+			};
+
+			// Prefer team-level TPM limit (reflects the per-user token quota)
+			// Fall back to key-level limits if present
+			const team = data.teams?.[0];
+			const key = data.keys?.[0];
+
+			// LiteLLM tracks spend in dollars; the 429 error says "Limit type: tokens"
+			// meaning the limit tracked here is token-based, not dollar-based.
+			// The X-Ratelimit-User-Limit-Tokens header (5000000) matches the user tpm_limit.
+			const tpmLimit = team?.tpm_limit ?? key?.tpm_limit ?? null;
+			if (tpmLimit !== null) {
+				quota.limit = tpmLimit;
+			}
+
+			updateQuotaStatus(ctx);
+		} catch {
+			// Non-fatal — quota display degrades gracefully
+		}
 	});
 
 	// -------------------------------------------------------------------------
