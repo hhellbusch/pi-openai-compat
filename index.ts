@@ -2,6 +2,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ProviderModelConfig,
+	ThemeColor,
 } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_NAME = "openai-compat";
@@ -247,8 +248,9 @@ const session: SessionStats = {
 	contextWindow: null,
 };
 
-const QUOTA_STATUS_KEY = "openai-compat-quota";
+const QUOTA_STATUS_KEY  = "openai-compat-quota";
 const SESSION_STATUS_KEY = "openai-compat-session";
+const TTFT_STATUS_KEY    = "openai-compat-ttft";
 
 // Finish reason display: icon + label + colour
 const FINISH_REASON_MAP: Record<string, { icon: string; label: string; color: string }> = {
@@ -292,7 +294,7 @@ function updateQuotaStatus(ctx: ExtensionContext): void {
 
 	if (quota.remaining !== null && quota.limit !== null && quota.limit > 0) {
 		const pct = quota.remaining / quota.limit;
-		const color = pct < 0.10 ? "error" : pct < 0.25 ? "warning" : "dim";
+		const color = (pct < 0.10 ? "error" : pct < 0.25 ? "warning" : "dim") as ThemeColor;
 		const label = `🪙 ${fmtTokens(quota.remaining)}/${fmtTokens(quota.limit)} tkn`;
 		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg(color, label));
 		return;
@@ -323,7 +325,7 @@ function updateSessionStatus(ctx: ExtensionContext): void {
 		const def = FINISH_REASON_MAP[session.finishReason] ?? {
 			icon: "?", label: session.finishReason, color: "dim",
 		};
-		parts.push(ctx.ui.theme.fg(def.color, `${def.icon} ${def.label}`));
+		parts.push(ctx.ui.theme.fg(def.color as ThemeColor, `${def.icon} ${def.label}`));
 	}
 
 	if (parts.length > 0) {
@@ -339,6 +341,63 @@ function resetSessionStats(): void {
 	session.finishReason = null;
 	session.contextUsed = null;
 	session.contextWindow = null;
+}
+
+// ---------------------------------------------------------------------------
+// TTFT (time-to-first-token) waiting indicator
+//
+// With LiteMaaS + Qwen3, the model reasons inside <think>...</think> tags
+// that LiteLLM strips mid-stream. From Pi's perspective the connection is
+// open but silent — no SSE chunks arrive until thinking is complete.
+// This produces the "model stalled" appearance with no observable signal.
+//
+// Fix: start a setInterval on before_provider_request that updates a status
+// slot every second with elapsed time. First message_update stops the timer
+// and shows the TTFT. The elapsed counter proves Pi is alive and waiting;
+// the TTFT metric is a proxy for how long the model reasoned.
+// ---------------------------------------------------------------------------
+
+interface WaitState {
+	/** Timestamp when before_provider_request fired for this turn. */
+	requestSentAt: number | null;
+	/** Timestamp when the first message_update token arrived. */
+	firstTokenAt: number | null;
+	/** True once the first token has been received this turn. */
+	gotFirstToken: boolean;
+	/** Active setInterval handle. */
+	timer: ReturnType<typeof setInterval> | null;
+	/** Captured ctx.ui reference for use inside the interval callback. */
+	ui: ExtensionContext["ui"] | null;
+}
+
+const wait: WaitState = {
+	requestSentAt: null,
+	firstTokenAt: null,
+	gotFirstToken: false,
+	timer: null,
+	ui: null,
+};
+
+function clearWaitTimer(): void {
+	if (wait.timer !== null) {
+		clearInterval(wait.timer);
+		wait.timer = null;
+	}
+}
+
+function tickWaitStatus(): void {
+	if (!wait.ui || !wait.requestSentAt || wait.gotFirstToken) return;
+	const elapsed = Math.round((Date.now() - wait.requestSentAt) / 1000);
+	wait.ui.setStatus(TTFT_STATUS_KEY, wait.ui.theme.fg("warning", `⏳ ${elapsed}s`));
+}
+
+function resetWaitState(ctx: ExtensionContext): void {
+	clearWaitTimer();
+	wait.requestSentAt = null;
+	wait.firstTokenAt  = null;
+	wait.gotFirstToken = false;
+	wait.ui            = null;
+	ctx.ui.setStatus(TTFT_STATUS_KEY, undefined);
 }
 
 export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<void> {
@@ -435,16 +494,63 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 	});
 
 	// -------------------------------------------------------------------------
+	// TTFT waiting indicator — turn_start / before_provider_request / message_update
+	// -------------------------------------------------------------------------
+
+	// Reset per-turn state before each LLM turn.
+	pi.on("turn_start", (_event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_NAME) return;
+		resetWaitState(ctx);
+	});
+
+	// Request dispatched — start the elapsed-time ticker.
+	pi.on("before_provider_request", (_event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_NAME) return;
+		wait.requestSentAt = Date.now();
+		wait.ui            = ctx.ui;
+		clearWaitTimer();
+		tickWaitStatus();  // show immediately rather than waiting for first tick
+		wait.timer = setInterval(tickWaitStatus, 1000);
+	});
+
+	// First token arrived — stop ticker, show TTFT, then dim after 5s.
+	pi.on("message_update", (event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_NAME) return;
+		if ((event.message as { role?: string }).role !== "assistant") return;
+		if (wait.gotFirstToken) return;
+
+		wait.gotFirstToken = true;
+		wait.firstTokenAt  = Date.now();
+		clearWaitTimer();
+
+		if (wait.requestSentAt && wait.firstTokenAt) {
+			const ttft = ((wait.firstTokenAt - wait.requestSentAt) / 1000).toFixed(1);
+			ctx.ui.setStatus(TTFT_STATUS_KEY, ctx.ui.theme.fg("dim", `⚡ ${ttft}s`));
+		}
+	});
+
+	// Safety net: if the turn ends without any tokens (abort / error), clear.
+	pi.on("turn_end", (_event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_NAME) return;
+		clearWaitTimer();
+		if (!wait.gotFirstToken) {
+			ctx.ui.setStatus(TTFT_STATUS_KEY, undefined);
+		}
+	});
+
+	// -------------------------------------------------------------------------
 	// Shared lifecycle hooks
 	// -------------------------------------------------------------------------
 
 	pi.on("model_select", (_event, ctx) => {
 		updateQuotaStatus(ctx);
 		updateSessionStatus(ctx);
+		resetWaitState(ctx);
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		resetSessionStats();
+		resetWaitState(ctx);
 		updateQuotaStatus(ctx);
 		updateSessionStatus(ctx);
 	});
