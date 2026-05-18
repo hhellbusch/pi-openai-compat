@@ -305,6 +305,56 @@ function fmtResetTime(resetAt: string): string {
 	return m ? `${m[1]} ${m[2]}` : resetAt;
 }
 
+// -------------------------------------------------------------------------
+// Sliding-window RPM/TPM tracking
+//
+// LiteLLM MaaS doesn't send rate-limit headers on streaming responses,
+// so we track usage locally using a 60-second sliding window.
+// -------------------------------------------------------------------------
+
+const TRACKING_WINDOW_MS = 60_000;
+
+function trackRequest(tokenCount: number): void {
+	const now = Date.now();
+
+	// Reset request window every 60s
+	if (now - quota.requestWindowStart >= TRACKING_WINDOW_MS) {
+		quota.requestWindow = 0;
+		quota.requestWindowStart = now;
+	}
+	quota.requestWindow++;
+
+	// Add to token usage window
+	quota.tokenUsageWindow.push({ timestamp: now, totalTokens: tokenCount });
+
+	// Prune expired entries (>60s old)
+	const cutoff = now - TRACKING_WINDOW_MS;
+	quota.tokenUsageWindow = quota.tokenUsageWindow.filter((e) => e.timestamp >= cutoff);
+}
+
+function getRollingTPM(): number {
+	const now = Date.now();
+	const cutoff = now - TRACKING_WINDOW_MS;
+	return quota.tokenUsageWindow
+		.filter((e) => e.timestamp >= cutoff)
+		.reduce((sum, e) => sum + e.totalTokens, 0);
+}
+
+function getRollingRPM(): number {
+	const now = Date.now();
+	const cutoff = now - TRACKING_WINDOW_MS;
+	// Count distinct requests whose window start falls within the last 60s
+	return quota.requestWindow;
+}
+
+function rpmWindowReset(): void {
+	const now = Date.now();
+	if (now - quota.requestWindowStart >= TRACKING_WINDOW_MS) {
+		quota.requestWindow = 0;
+		quota.requestWindowStart = now;
+	}
+}
+
 function updateQuotaStatus(ctx: ExtensionContext): void {
 	if (ctx.model?.provider !== PROVIDER_NAME) {
 		ctx.ui.setStatus(QUOTA_STATUS_KEY, undefined);
@@ -532,6 +582,7 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 					quota.dollarSpend = ui.spend ?? 0;
 					quota.dollarBudget = ui.max_budget;
 					quota.tokenLimit = ui.tpm_limit;
+					quota.rpmLimit = ui.rpm_limit;
 				} else if (data.keys?.[0]) {
 					// Fallback: key-level spend if user_info not present
 					const k = data.keys[0];
@@ -543,57 +594,6 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 			}
 		} catch (err) {
 			console.error(`[pi-openai-compat] /user/info failed:`, err);
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// Sliding-window RPM/TPM tracking
-	//
-	// LiteLLM MaaS doesn't send rate-limit headers on streaming responses,
-	// so we track usage locally using a 60-second sliding window. This gives
-	// real-time visibility into how close you are to hitting RPM/TPM limits.
-	// -------------------------------------------------------------------------
-
-	const WINDOW_MS = 60_000;
-
-	function trackRequest(tokenCount: number): void {
-		const now = Date.now();
-
-		// Reset request window every 60s
-		if (now - quota.requestWindowStart >= WINDOW_MS) {
-			quota.requestWindow = 0;
-			quota.requestWindowStart = now;
-		}
-		quota.requestWindow++;
-
-		// Add to token usage window
-		quota.tokenUsageWindow.push({ timestamp: now, totalTokens: tokenCount });
-
-		// Prune expired entries (>60s old)
-		const cutoff = now - WINDOW_MS;
-		quota.tokenUsageWindow = quota.tokenUsageWindow.filter((e) => e.timestamp >= cutoff);
-	}
-
-	function getRollingTPM(): number {
-		const now = Date.now();
-		const cutoff = now - WINDOW_MS;
-		return quota.tokenUsageWindow
-			.filter((e) => e.timestamp >= cutoff)
-			.reduce((sum, e) => sum + e.totalTokens, 0);
-	}
-
-	function getRollingRPM(): number {
-		const now = Date.now();
-		const cutoff = now - WINDOW_MS;
-		// Count distinct requests whose window start falls within the last 60s
-		return quota.requestWindow;
-	}
-
-	function rpmWindowReset(): void {
-		const now = Date.now();
-		if (now - quota.requestWindowStart >= WINDOW_MS) {
-			quota.requestWindow = 0;
-			quota.requestWindowStart = now;
 		}
 	}
 
