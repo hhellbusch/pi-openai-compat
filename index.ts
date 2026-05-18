@@ -299,7 +299,7 @@ function updateSessionStatus(ctx: ExtensionContext): void {
 	const parts: string[] = [];
 	if (session.contextUsed !== null && session.contextWindow !== null && session.contextWindow > 0) {
 		const pct = Math.round(session.contextUsed / session.contextWindow * 100);
-		const color = pct > 85 ? "error" : pct > 65 ? "warning" : "dim";
+		const color = pct > 60 ? "error" : pct > 40 ? "warning" : "dim";
 		parts.push(ctx.ui.theme.fg(color, `${fmtTokens(session.contextUsed)}/${fmtTokens(session.contextWindow)} ctx ${pct}%`));
 	}
 	if (session.finishReason) {
