@@ -215,7 +215,7 @@ function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 interface QuotaState {
 	/** True when a 429 has been received and not yet cleared by a 200. */
 	isLimited: boolean;
-	/** Reset timestamp from Reset_at header (e.g. "2026-05-13 00:57:30 UTC"). */
+	/** Reset timestamp from 429 body (e.g. "2026-05-13 00:57:30 UTC"). */
 	resetAt: string | null;
 	/** Retry-After seconds from 429 response. */
 	retryAfterSecs: number | null;
@@ -223,6 +223,8 @@ interface QuotaState {
 	remaining: number | null;
 	/** User-level token limit from X-Ratelimit-User-Limit-Tokens. */
 	limit: number | null;
+	/** Last pct at which a threshold notification was sent (avoids repeat spam). */
+	lastNotifiedPct: number | null;
 }
 
 interface SessionStats {
@@ -240,6 +242,7 @@ const quota: QuotaState = {
 	retryAfterSecs: null,
 	remaining: null,
 	limit: null,
+	lastNotifiedPct: null,
 };
 
 const session: SessionStats = {
@@ -297,6 +300,19 @@ function updateQuotaStatus(ctx: ExtensionContext): void {
 		const color = (pct < 0.10 ? "error" : pct < 0.25 ? "warning" : "dim") as ThemeColor;
 		const label = `tkn: ${fmtTokens(quota.remaining)}/${fmtTokens(quota.limit)}`;
 		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg(color, label));
+
+		// Fire a notification when crossing warning/error thresholds.
+		// Only notify once per threshold crossing to avoid spam.
+		const crossed25 = pct < 0.25 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct >= 0.25);
+		const crossed10 = pct < 0.10 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct >= 0.10);
+
+		if (crossed10) {
+			quota.lastNotifiedPct = pct;
+			ctx.ui.notify(`⚠️ Token quota critical: ${fmtTokens(quota.remaining)} remaining (${Math.round(pct * 100)}% of ${fmtTokens(quota.limit)}). Save your work — the session may be cut short.`, "error");
+		} else if (crossed25) {
+			quota.lastNotifiedPct = pct;
+			ctx.ui.notify(`Token quota at ${Math.round(pct * 100)}%: ${fmtTokens(quota.remaining)} of ${fmtTokens(quota.limit)} remaining.`, "warning");
+		}
 		return;
 	}
 
@@ -498,14 +514,27 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 
 		if (event.status === 429) {
 			quota.isLimited = true;
-			quota.resetAt = h["reset_at"] ?? null;
+			quota.remaining = 0;
+			quota.lastNotifiedPct = 0;
 			const retryRaw = h["retry-after"];
 			quota.retryAfterSecs = retryRaw ? parseInt(retryRaw, 10) : null;
-			quota.remaining = 0;
+			// LiteLLM doesn't expose the reset timestamp in headers on 429 —
+			// it's in the error body which isn't accessible here. Use retryAfterSecs
+			// to compute an approximate reset time if the header is present.
+			if (quota.retryAfterSecs !== null) {
+				const resetDate = new Date(Date.now() + quota.retryAfterSecs * 1000);
+				quota.resetAt = resetDate.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+			} else {
+				quota.resetAt = null;
+			}
+			// Active notification — 429 means we're already blocked, not just low
+			const resetMsg = quota.resetAt ? ` Resets at ${fmtResetTime(quota.resetAt)}.` : "";
+			ctx.ui.notify(`⛔ Token quota exhausted.${resetMsg} Switch to a different model or wait for reset.`, "error");
 		} else if (event.status === 200) {
 			quota.isLimited = false;
 			quota.resetAt = null;
 			quota.retryAfterSecs = null;
+			quota.lastNotifiedPct = null; // reset so thresholds fire fresh next session
 			// User-level limits are what trigger 429 — prefer those over pool limits
 			const userRemaining = h["x-ratelimit-user-remaining-tokens"];
 			const userLimit     = h["x-ratelimit-user-limit-tokens"];
