@@ -272,16 +272,16 @@ interface SessionStats {
 }
 const session: SessionStats = { finishReason: null, contextUsed: null, contextWindow: null };
 
-const logDir = "~/.pi/logs/pi-openai-compat";
+const logDir = join(process.env.HOME || "~", ".pi", "logs", "pi-openai-compat");
 const logFile = "session-log.jsonl";
 
 function logEvent(ctx: ExtensionContext, evt: { ts: string; event: string; details: Record<string, unknown> }): void {
 	try {
-		const path = join(ctx.cwd, logDir, logFile);
-		if (!existsSync(dirname(path))) {
-			mkdirSync(dirname(path), { recursive: true });
+		const logPath = join(logDir, logFile);
+		if (!existsSync(dirname(logPath))) {
+			mkdirSync(dirname(logPath), { recursive: true });
 		}
-		appendFileSync(path, JSON.stringify(evt) + "\n", "utf8");
+		appendFileSync(logPath, JSON.stringify(evt) + "\n", "utf8");
 	} catch {
 		/* best-effort only — never interrupt the model loop */
 	}
