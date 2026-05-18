@@ -219,10 +219,12 @@ interface QuotaState {
 	resetAt: string | null;
 	/** Retry-After seconds from 429 response. */
 	retryAfterSecs: number | null;
-	/** Remaining user-level tokens from X-Ratelimit-User-Remaining-Tokens. */
-	remaining: number | null;
-	/** User-level token limit from X-Ratelimit-User-Limit-Tokens. */
-	limit: number | null;
+	/** Dollar spend from LiteLLM /user/info. */
+	dollarSpend: number | null;
+	/** Dollar budget from LiteLLM /user/info. */
+	dollarBudget: number | null;
+	/** Token limit (tpm_limit) from LiteLLM /user/info. */
+	tokenLimit: number | null;
 	/** Last pct at which a threshold notification was sent (avoids repeat spam). */
 	lastNotifiedPct: number | null;
 }
@@ -240,8 +242,9 @@ const quota: QuotaState = {
 	isLimited: false,
 	resetAt: null,
 	retryAfterSecs: null,
-	remaining: null,
-	limit: null,
+	dollarSpend: null,
+	dollarBudget: null,
+	tokenLimit: null,
 	lastNotifiedPct: null,
 };
 
@@ -273,6 +276,12 @@ function fmtTokens(n: number): string {
 	return String(n);
 }
 
+function fmtDollars(n: number): string {
+	if (n >= 1000) return `$${(n / 1000).toFixed(1)}K`;
+	if (n >= 1) return `$${n.toFixed(2)}`;
+	return `$${n.toFixed(4)}`;
+}
+
 function fmtResetTime(resetAt: string): string {
 	// "2026-05-13 00:57:30 UTC" → "00:57 UTC"
 	const m = resetAt.match(/(\d{2}:\d{2}):\d{2} (UTC)/i);
@@ -295,28 +304,26 @@ function updateQuotaStatus(ctx: ExtensionContext): void {
 		return;
 	}
 
-	if (quota.remaining !== null && quota.limit !== null && quota.limit > 0) {
-		const pct = quota.remaining / quota.limit;
-		const color = (pct < 0.10 ? "error" : pct < 0.25 ? "warning" : "dim") as ThemeColor;
-		const label = `tkn: ${fmtTokens(quota.remaining)}/${fmtTokens(quota.limit)}`;
+	if (quota.dollarBudget !== null && quota.dollarSpend !== null && quota.dollarBudget > 0) {
+		const pct = quota.dollarSpend / quota.dollarBudget;
+		const color = (pct > 0.90 ? "error" : pct > 0.75 ? "warning" : "dim") as ThemeColor;
+		const label = `${fmtDollars(quota.dollarSpend)}/${fmtDollars(quota.dollarBudget)} ${Math.round(pct * 100)}%`;
 		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg(color, label));
 
 		// Fire a notification when crossing warning/error thresholds.
 		// Only notify once per threshold crossing to avoid spam.
-		const crossed25 = pct < 0.25 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct >= 0.25);
-		const crossed10 = pct < 0.10 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct >= 0.10);
+		const crossed75 = pct > 0.75 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct <= 0.75);
+		const crossed90 = pct > 0.90 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct <= 0.90);
 
-		if (crossed10) {
+		if (crossed90) {
 			quota.lastNotifiedPct = pct;
-			ctx.ui.notify(`⚠️ Token quota critical: ${fmtTokens(quota.remaining)} remaining (${Math.round(pct * 100)}% of ${fmtTokens(quota.limit)}). Save your work — the session may be cut short.`, "error");
-		} else if (crossed25) {
+			ctx.ui.notify(`⚠️ Budget critical: $${quota.dollarSpend.toFixed(2)} of $${quota.dollarBudget.toFixed(2)} used (${Math.round(pct * 100)}%). Save your work.`, "error");
+		} else if (crossed75) {
 			quota.lastNotifiedPct = pct;
-			ctx.ui.notify(`Token quota at ${Math.round(pct * 100)}%: ${fmtTokens(quota.remaining)} of ${fmtTokens(quota.limit)} remaining.`, "warning");
+			ctx.ui.notify(`Budget at ${Math.round(pct * 100)}%: $${quota.dollarSpend.toFixed(2)} of $${quota.dollarBudget.toFixed(2)} used.`, "warning");
 		}
 		return;
 	}
-
-	ctx.ui.setStatus(QUOTA_STATUS_KEY, undefined);
 }
 
 function updateSessionStatus(ctx: ExtensionContext): void {
@@ -451,6 +458,7 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 
 	// Poll /user/info at load time (not in a handler) because session_start may
 	// have already fired before this handler is registered.
+	// LiteLLM MaaS nests quota under user_info (not top-level).
 	{
 		const infoUrl = baseUrl.replace(/\/v1\/?$/, "") + "/user/info";
 		try {
@@ -462,33 +470,34 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 			const resp = await fetch(infoUrl, { headers });
 			if (resp.ok) {
 				const data = await resp.json() as {
-					tpm_limit?: number | null;
-					rpm_limit?: number | null;
-					spend?: number | null;
-					max_budget?: number | null;
-					keys?: Array<{
-						token_budget_duration?: string | null;
-						max_budget?: number | null;
+					user_info?: {
 						spend?: number | null;
+						max_budget?: number | null;
 						tpm_limit?: number | null;
 						rpm_limit?: number | null;
-					}>;
-					teams?: Array<{
-						tpm_limit?: number | null;
-						max_budget?: number | null;
+					};
+					keys?: Array<{
 						spend?: number | null;
+						max_budget?: number | null;
+						tpm_limit?: number | null;
+						models?: string[];
 					}>;
 				};
 
-				// LiteLLM returns quota in three places; prefer top-level.
-				const topLevel = data as { tpm_limit?: number | null };
-				const key = data.keys?.[0];
-				const team = data.teams?.[0];
-				const tpmLimit = topLevel.tpm_limit ?? key?.tpm_limit ?? team?.tpm_limit ?? null;
-				if (tpmLimit !== null) {
-					quota.limit = tpmLimit;
+				// LiteLLM MaaS nests spend/budget under user_info
+				const ui = data.user_info;
+				if (ui) {
+					quota.dollarSpend = ui.spend ?? 0;
+					quota.dollarBudget = ui.max_budget;
+					quota.tokenLimit = ui.tpm_limit;
+				} else if (data.keys?.[0]) {
+					// Fallback: key-level spend if user_info not present
+					const k = data.keys[0];
+					quota.dollarSpend = k.spend ?? 0;
+					quota.dollarBudget = k.max_budget;
+					quota.tokenLimit = k.tpm_limit;
 				}
-				console.log(`[pi-openai-compat] /user/info: tpm_limit=${topLevel.tpm_limit}, key=${key?.tpm_limit}, team=${team?.tpm_limit} => limit=${quota.limit}`);
+			
 			}
 		} catch (err) {
 			console.error(`[pi-openai-compat] /user/info failed:`, err);
@@ -496,50 +505,73 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 	}
 
 	// -------------------------------------------------------------------------
-	// Quota monitoring — rate limit headers → quota status slot
+	// Quota monitoring — 429 detection + periodic spend refresh
+	//
+	// LiteLLM MaaS doesn't send rate-limit headers on streaming responses,
+	// so we track 429s directly and poll /user/info periodically for fresh
+	// dollar-spend data.
 	// -------------------------------------------------------------------------
+
+	// Periodically refresh spend data so the status bar stays current.
+	// Poll every 30s during active use.
+	let lastSpendPoll = 0;
+	const SPEND_POLL_INTERVAL_MS = 30_000;
+
+	function pollSpend(ctx: ExtensionContext): void {
+		const now = Date.now();
+		if (now - lastSpendPoll < SPEND_POLL_INTERVAL_MS) return;
+		lastSpendPoll = now;
+
+		const infoUrl = baseUrl.replace(/\/v1\/?$/, "") + "/user/info";
+		fetch(infoUrl, {
+			headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+		}).then(async (resp) => {
+			if (!resp.ok) return;
+			const data = await resp.json() as {
+				user_info?: { spend?: number | null; max_budget?: number | null; tpm_limit?: number | null };
+				keys?: Array<{ spend?: number | null; max_budget?: number | null; tpm_limit?: number | null }>;
+			};
+			const ui = data.user_info;
+			if (ui) {
+				quota.dollarSpend = ui.spend ?? 0;
+				quota.dollarBudget = ui.max_budget;
+				quota.tokenLimit = ui.tpm_limit;
+			} else if (data.keys?.[0]) {
+				const k = data.keys[0];
+				quota.dollarSpend = k.spend ?? 0;
+				quota.dollarBudget = k.max_budget;
+				quota.tokenLimit = k.tpm_limit;
+			}
+			updateQuotaStatus(ctx);
+		}).catch(() => {});
+	}
 
 	pi.on("after_provider_response", (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_NAME) return;
 
-		const h = event.headers;
-
 		if (event.status === 429) {
 			quota.isLimited = true;
-			quota.remaining = 0;
 			quota.lastNotifiedPct = 0;
+			const h = event.headers;
 			const retryRaw = h["retry-after"];
 			quota.retryAfterSecs = retryRaw ? parseInt(retryRaw, 10) : null;
-			// LiteLLM doesn't expose the reset timestamp in headers on 429 —
-			// it's in the error body which isn't accessible here. Use retryAfterSecs
-			// to compute an approximate reset time if the header is present.
 			if (quota.retryAfterSecs !== null) {
 				const resetDate = new Date(Date.now() + quota.retryAfterSecs * 1000);
 				quota.resetAt = resetDate.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
 			} else {
 				quota.resetAt = null;
 			}
-			// Active notification — 429 means we're already blocked, not just low
 			const resetMsg = quota.resetAt ? ` Resets at ${fmtResetTime(quota.resetAt)}.` : "";
 			ctx.ui.notify(`⛔ Token quota exhausted.${resetMsg} Switch to a different model or wait for reset.`, "error");
 		} else if (event.status === 200) {
 			quota.isLimited = false;
 			quota.resetAt = null;
 			quota.retryAfterSecs = null;
-			quota.lastNotifiedPct = null; // reset so thresholds fire fresh next session
-			// User-level limits are what trigger 429 — prefer those over pool limits
-			const userRemaining = h["x-ratelimit-user-remaining-tokens"];
-			const userLimit     = h["x-ratelimit-user-limit-tokens"];
-			const poolRemaining = h["x-ratelimit-remaining-tokens"];
-			const poolLimit     = h["x-ratelimit-limit-tokens"];
-			quota.remaining = userRemaining !== undefined
-				? parseInt(userRemaining, 10)
-				: poolRemaining !== undefined ? parseInt(poolRemaining, 10) : null;
-			quota.limit = userLimit !== undefined
-				? parseInt(userLimit, 10)
-				: poolLimit !== undefined ? parseInt(poolLimit, 10) : null;
+			quota.lastNotifiedPct = null;
 		}
 
+		// Periodically refresh spend data
+		pollSpend(ctx);
 		updateQuotaStatus(ctx);
 	});
 
