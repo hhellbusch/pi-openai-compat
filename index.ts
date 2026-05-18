@@ -449,16 +449,9 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 		models,
 	});
 
-	// -------------------------------------------------------------------------
-	// Proactive quota poll — fetch /user/info at session start
-	//
-	// The rate-limit headers on 200 responses update the quota slot reactively,
-	// but only after the first request. LiteLLM's /user/info endpoint returns
-	// the current budget state — poll it on session_start so the status slot
-	// shows remaining tokens before any request is made.
-	// -------------------------------------------------------------------------
-
-	pi.on("session_start", async (_event, ctx) => {
+	// Poll /user/info at load time (not in a handler) because session_start may
+	// have already fired before this handler is registered.
+	{
 		const infoUrl = baseUrl.replace(/\/v1\/?$/, "") + "/user/info";
 		try {
 			const headers: Record<string, string> = {
@@ -467,48 +460,40 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 			if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
 
 			const resp = await fetch(infoUrl, { headers });
-			if (!resp.ok) return;
-
-			const data = await resp.json() as {
-				// Top-level user info (LiteLLM returns quota here)
-				tpm_limit?: number | null;
-				rpm_limit?: number | null;
-				spend?: number | null;
-				max_budget?: number | null;
-				// Key-level info (some LiteLLM setups nest keys under .keys)
-				keys?: Array<{
-					token_budget_duration?: string | null;
-					max_budget?: number | null;
-					spend?: number | null;
+			if (resp.ok) {
+				const data = await resp.json() as {
 					tpm_limit?: number | null;
 					rpm_limit?: number | null;
-				}>;
-				// Team-level info (some LiteLLM setups nest under .teams)
-				teams?: Array<{
-					tpm_limit?: number | null;
-					max_budget?: number | null;
 					spend?: number | null;
-				}>;
-			};
+					max_budget?: number | null;
+					keys?: Array<{
+						token_budget_duration?: string | null;
+						max_budget?: number | null;
+						spend?: number | null;
+						tpm_limit?: number | null;
+						rpm_limit?: number | null;
+					}>;
+					teams?: Array<{
+						tpm_limit?: number | null;
+						max_budget?: number | null;
+						spend?: number | null;
+					}>;
+				};
 
-			// LiteLLM returns quota in three places depending on configuration:
-			// 1. Top level (this LiteLLM/MaaS setup): direct on user object
-			// 2. Under .keys[0] (key-based auth setups)
-			// 3. Under .teams[0] (team-based setups)
-			// Prefer top-level, then key-level, then team-level.
-			const topLevel = data as { tpm_limit?: number | null };
-			const key = data.keys?.[0];
-			const team = data.teams?.[0];
-			const tpmLimit = topLevel.tpm_limit ?? key?.tpm_limit ?? team?.tpm_limit ?? null;
-			if (tpmLimit !== null) {
-				quota.limit = tpmLimit;
+				// LiteLLM returns quota in three places; prefer top-level.
+				const topLevel = data as { tpm_limit?: number | null };
+				const key = data.keys?.[0];
+				const team = data.teams?.[0];
+				const tpmLimit = topLevel.tpm_limit ?? key?.tpm_limit ?? team?.tpm_limit ?? null;
+				if (tpmLimit !== null) {
+					quota.limit = tpmLimit;
+				}
+				console.log(`[pi-openai-compat] /user/info: tpm_limit=${topLevel.tpm_limit}, key=${key?.tpm_limit}, team=${team?.tpm_limit} => limit=${quota.limit}`);
 			}
-
-			updateQuotaStatus(ctx);
-		} catch {
-			// Non-fatal — quota display degrades gracefully
+		} catch (err) {
+			console.error(`[pi-openai-compat] /user/info failed:`, err);
 		}
-	});
+	}
 
 	// -------------------------------------------------------------------------
 	// Quota monitoring — rate limit headers → quota status slot
