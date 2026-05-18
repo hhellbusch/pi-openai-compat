@@ -7,22 +7,20 @@ import type {
 
 const PROVIDER_NAME = "openai-compat";
 
+// ---------------------------------------------------------------------------
+// Model discovery (unchanged from upstream)
+// ---------------------------------------------------------------------------
+
 interface OpenAIModelEntry {
 	id: string;
 	owned_by?: string;
-	// llama.cpp fields
-	meta?: {
-		n_ctx_train?: number;
-	};
-	// LiteLLM / OpenAI-compatible fields (may be present on /v1/models)
+	meta?: { n_ctx_train?: number };
 	max_tokens?: number;
 	max_input_tokens?: number;
 	context_window?: number;
-	// Merged in from LiteLLM /model/info
 	supportsVision?: boolean;
 }
 
-// LiteLLM-specific /model/info response shape
 interface LiteLLMModelInfo {
 	model_name: string;
 	model_info?: {
@@ -41,46 +39,29 @@ interface OpenAIModelsResponse {
 	models?: OpenAIModelEntry[];
 }
 
-// Known context windows for common models — fallback when the API is silent.
 const KNOWN_CONTEXT_WINDOWS: Array<[RegExp, number]> = [
 	[/qwen3/i, 131072],
 	[/qwq-32b/i, 131072],
 	[/deepseek-r1/i, 131072],
 ];
 
-// Known reasoning/thinking model ID patterns (case-insensitive).
-// LiteLLM's supports_reasoning field is unreliable (often null), so we detect by name.
 const REASONING_MODEL_PATTERNS = [
-	/qwen3/i,
-	/qwq/i,
-	/deepseek-r1/i,
-	/deepseek-reasoner/i,
+	/qwen3/i, /qwq/i, /deepseek-r1/i, /deepseek-reasoner/i,
 ];
 
-// LiteLLM supports stream_options.include_usage; llama.cpp does not.
-// Default: enabled. Set OPENAI_COMPAT_NO_STREAMING_USAGE=1 for llama.cpp backends.
 const STREAMING_USAGE_ENABLED = process.env.OPENAI_COMPAT_NO_STREAMING_USAGE !== "1";
 
 function resolveBaseUrl(): string | undefined {
-	return (
-		process.env.OPENAI_COMPAT_BASE_URL ??
-		process.env.OPENAI_BASE_URL
-	);
+	return process.env.OPENAI_COMPAT_BASE_URL ?? process.env.OPENAI_BASE_URL;
 }
 
 function resolveApiKey(): string | undefined {
-	return (
-		process.env.OPENAI_COMPAT_API_KEY ??
-		process.env.OPENAI_API_KEY
-	);
+	return process.env.OPENAI_COMPAT_API_KEY ?? process.env.OPENAI_API_KEY;
 }
 
 async function fetchJson<T>(url: string, headers: Record<string, string>): Promise<T | null> {
 	try {
-		const response = await fetch(url, {
-			signal: AbortSignal.timeout(5000),
-			headers,
-		});
+		const response = await fetch(url, { signal: AbortSignal.timeout(5000), headers });
 		if (!response.ok) return null;
 		return (await response.json()) as T;
 	} catch {
@@ -91,118 +72,63 @@ async function fetchJson<T>(url: string, headers: Record<string, string>): Promi
 async function discoverModels(baseUrl: string, apiKey?: string): Promise<OpenAIModelEntry[]> {
 	const base = baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
 	const headers: Record<string, string> = { Accept: "application/json" };
-	if (apiKey) {
-		headers["Authorization"] = `Bearer ${apiKey}`;
-	}
+	if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
 
-	// Primary: standard OpenAI /v1/models
 	const modelsBody = await fetchJson<OpenAIModelsResponse>(`${base}/v1/models`, headers);
-	if (!modelsBody) {
-		throw new Error("Failed to fetch /v1/models");
-	}
+	if (!modelsBody) throw new Error("Failed to fetch /v1/models");
 
-	// llama.cpp returns both .data (OpenAI standard) and .models (legacy)
-	const entries = (modelsBody.data ?? modelsBody.models ?? [])
-		.filter((m) => m.id && m.id.length > 0);
+	const entries = (modelsBody.data ?? modelsBody.models ?? []).filter((m) => m.id && m.id.length > 0);
 
-	// Secondary: LiteLLM /model/info for richer metadata (context window, vision).
-	// Non-fatal — plain OpenAI/llama.cpp endpoints without this route are unaffected.
+	// LiteLLM /model/info for richer metadata.
 	const infoBody = await fetchJson<LiteLLMModelInfoResponse>(`${base}/model/info`, headers);
 	if (infoBody?.data) {
 		const infoByName = new Map<string, LiteLLMModelInfo>();
-		for (const item of infoBody.data) {
-			infoByName.set(item.model_name, item);
-		}
+		for (const item of infoBody.data) infoByName.set(item.model_name, item);
 		for (const entry of entries) {
-			const info = infoByName.get(entry.id);
-			if (!info?.model_info) continue;
-			const mi = info.model_info;
-			// max_tokens on model_info is the context window (LiteLLM convention)
-			if (mi.max_tokens != null && mi.max_tokens > 0) {
-				entry.context_window = mi.max_tokens;
-			}
-			if (mi.max_input_tokens != null && mi.max_input_tokens > 0) {
-				entry.max_input_tokens = mi.max_input_tokens;
-			}
-			if (mi.supports_vision != null) {
-				entry.supportsVision = mi.supports_vision;
-			}
+			const mi = infoByName.get(entry.id)?.model_info;
+			if (!mi) continue;
+			if (mi.max_tokens != null && mi.max_tokens > 0) entry.context_window = mi.max_tokens;
+			if (mi.max_input_tokens != null && mi.max_input_tokens > 0) entry.max_input_tokens = mi.max_input_tokens;
+			if (mi.supports_vision != null) entry.supportsVision = mi.supports_vision;
 		}
 	}
-
 	return entries;
 }
 
-/**
- * Derive the model ID to register with pi from a raw ramalama/llama.cpp entry.
- *
- * ramalama prefixes model IDs with a registry namespace, e.g.
- * "library/qwen2.5-coder". That embedded '/' creates a 3-segment pi model
- * reference ("openai-compat/library/qwen2.5-coder") which breaks the
- * --models glob "openai-compat/*" (minimatch's * does not cross '/').
- *
- * ramalama also accepts the bare basename in chat/completions requests, so
- * we register just the basename as the id and use the full original as the
- * display name.
- */
 function resolveModelId(entry: OpenAIModelEntry): string {
 	const slashIdx = entry.id.lastIndexOf("/");
 	return slashIdx !== -1 ? entry.id.slice(slashIdx + 1) : entry.id;
 }
 
 function isReasoningModel(modelId: string): boolean {
-	return REASONING_MODEL_PATTERNS.some((pattern) => pattern.test(modelId));
+	return REASONING_MODEL_PATTERNS.some((p) => p.test(modelId));
 }
 
 function resolveContextWindow(entry: OpenAIModelEntry): number {
-	// Prefer API-reported values (first non-zero wins)
-	const fromApi =
-		entry.context_window ||
-		entry.max_input_tokens ||
-		entry.max_tokens ||
-		entry.meta?.n_ctx_train;
+	const fromApi = entry.context_window ?? entry.max_input_tokens ?? entry.max_tokens ?? entry.meta?.n_ctx_train;
 	if (fromApi && fromApi > 0) return fromApi;
-
-	// Fall back to known-model table
 	for (const [pattern, size] of KNOWN_CONTEXT_WINDOWS) {
 		if (pattern.test(entry.id)) return size;
 	}
-
 	return 32768;
 }
 
 function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 	const contextWindow = resolveContextWindow(entry);
 	const reasoning = isReasoningModel(entry.id);
-	// Reasoning models need more output headroom for thinking traces.
-	const maxTokens = reasoning
-		? Math.min(16384, contextWindow)
-		: Math.min(4096, contextWindow);
-
-	const input: ProviderModelConfig["input"] = entry.supportsVision
-		? ["text", "image"]
-		: ["text"];
-
 	return {
-		id: resolveModelId(entry),  // strips ramalama namespace prefix if present
-		name: entry.id,             // full original ID shown in model picker
+		id: resolveModelId(entry),
+		name: entry.id,
 		reasoning,
-		input,
+		input: entry.supportsVision ? ["text", "image"] : ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow,
-		maxTokens,
+		maxTokens: reasoning ? Math.min(16384, contextWindow) : Math.min(4096, contextWindow),
 		compat: {
-			// llama.cpp uses max_tokens, not max_completion_tokens
 			maxTokensField: "max_tokens",
-			// llama.cpp rejects the "developer" system-prompt role
 			supportsDeveloperRole: false,
-			// llama.cpp does not support reasoning_effort
 			supportsReasoningEffort: false,
-			// LiteLLM supports stream_options.include_usage (enables context tracking).
-			// Set OPENAI_COMPAT_NO_STREAMING_USAGE=1 to disable for llama.cpp backends.
 			supportsUsageInStreaming: STREAMING_USAGE_ENABLED,
-			// Qwen3 on vLLM requires chat_template_kwargs: {enable_thinking: true}
-			// to activate the reasoning chain. Non-Qwen models leave this unset.
 			...(reasoning ? { thinkingFormat: "qwen-chat-template" } : {}),
 		},
 	};
@@ -212,79 +138,144 @@ function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 // Footer state — quota + session stats shown in Pi status bar
 // ---------------------------------------------------------------------------
 
-interface UsageEntry {
-	timestamp: number;
-	totalTokens: number;
+interface UsageEntry { timestamp: number; totalTokens: number; }
+
+/** Quota limits from LiteLLM /user/info. */
+interface QuotaLimits {
+	tokenLimit: number | null;   // tpm_limit
+	rpmLimit: number | null;     // rpm_limit
 }
 
-interface QuotaState {
-	/** True when a 429 has been received and not yet cleared by a 200. */
+/** Sliding window for RPM/TPM tracking. */
+interface UsageWindow {
+	windowStart: number;   // start of current 60s window
+	requests: number;      // requests in current window
+	entries: UsageEntry[]; // token-count entries in current window
+}
+
+/** Prune window entries older than 60s; reset counters if window expired. */
+function pruneWindow(w: UsageWindow): void {
+	const cutoff = Date.now() - TRACKING_WINDOW_MS;
+	if (w.windowStart < cutoff) {
+		w.windowStart = Date.now();
+		w.requests = 0;
+		w.entries.length = 0;
+	}
+	w.entries = w.entries.filter((e) => e.timestamp >= cutoff);
+}
+
+const TRACKING_WINDOW_MS = 60_000;
+const windowState: UsageWindow = { windowStart: 0, requests: 0, entries: [] };
+
+/** Call on request start to increment RPM counter. */
+function trackRequestStart(): void {
+	pruneWindow(windowState);
+	windowState.requests++;
+}
+
+/** Call on response to record token count for TPM. */
+function trackTokens(tokenCount: number): void {
+	windowState.entries.push({ timestamp: Date.now(), totalTokens: tokenCount });
+	pruneWindow(windowState);
+}
+
+/** Current RPM from sliding window. */
+function getRollingRPM(): number {
+	pruneWindow(windowState);
+	return windowState.requests;
+}
+
+/** Current TPM from sliding window. */
+function getRollingTPM(): number {
+	pruneWindow(windowState);
+	return windowState.entries.reduce((sum, e) => sum + e.totalTokens, 0);
+}
+
+/** Format a status-label string for RPM/TPM, with colour-coding per proximity to limit. */
+function buildQuotaLabel(ctx: ExtensionContext): string | undefined {
+	const rpm = getRollingRPM();
+	const tpm = getRollingTPM();
+	const parts: string[] = [];
+
+	if (quota.rpmLimit !== null) {
+		const rpmPct = rpm / quota.rpmLimit;
+		const rpmColor = rpmPct > 0.85 ? "error" : rpmPct > 0.65 ? "warning" : "dim" as ThemeColor;
+		parts.push(ctx.ui.theme.fg(rpmColor, `rps:${rpm}/${quota.rpmLimit}`));
+	}
+	if (quota.tokenLimit !== null) {
+		const tpmPct = tpm / quota.tokenLimit;
+		const tpmColor = tpmPct > 0.85 ? "error" : tpmPct > 0.65 ? "warning" : "dim" as ThemeColor;
+		parts.push(ctx.ui.theme.fg(tpmColor, `${fmtTokens(tpm)}/${fmtTokens(quota.tokenLimit)} tpm`));
+	}
+	return parts.length > 0 ? parts.join(ctx.ui.theme.fg("dim", "  ")) : undefined;
+}
+
+/** Check RPM threshold and fire alerts if crossing 85%. */
+function checkQuotaAlerts(ctx: ExtensionContext): void {
+	if (quota.rpmLimit !== null) {
+		const rpm = getRollingRPM();
+		const rpmPct = rpm / quota.rpmLimit;
+		const crossed85 = rpmPct > 0.85 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct < 0.85);
+		if (crossed85) {
+			quota.lastNotifiedPct = rpmPct;
+			ctx.ui.notify(`⚠️ RPM approaching limit: ${rpm}/${quota.rpmLimit} requests/min (${Math.round(rpmPct * 100)}%). Slow down to avoid being cut off.`, "warning");
+		}
+	}
+}
+
+/** 429 detection state. */
+interface QuotaRateLimited {
 	isLimited: boolean;
-	/** Reset timestamp from 429 body (e.g. "2026-05-13 00:57:30 UTC"). */
 	resetAt: string | null;
-	/** Retry-After seconds from 429 response. */
 	retryAfterSecs: number | null;
-	/** Dollar spend from LiteLLM /user/info. */
-	dollarSpend: number | null;
-	/** Dollar budget from LiteLLM /user/info. */
-	dollarBudget: number | null;
-	/** Token limit (tpm_limit) from LiteLLM /user/info. */
-	tokenLimit: number | null;
-	/** Request-per-minute limit (rpm_limit) from LiteLLM /user/info. */
-	rpmLimit: number | null;
-	/** Last pct at which a threshold notification was sent (avoids repeat spam). */
-	lastNotifiedPct: number | null;
-	/** Sliding window: token usage entries per 60s window. */
-	tokenUsageWindow: UsageEntry[];
-	/** Sliding window: request count per 60s window. */
-	requestWindow: number;
-	/** Window start time for requests. */
-	requestWindowStart: number;
 }
 
+const rateLimited: QuotaRateLimited = { isLimited: false, resetAt: null, retryAfterSecs: null };
+const quota: QuotaLimits = { tokenLimit: null, rpmLimit: null };
+let lastNotifiedPct: number | null = null;
+
+function updateQuotaStatus(ctx: ExtensionContext): void {
+	if (ctx.model?.provider !== PROVIDER_NAME) {
+		ctx.ui.setStatus(QUOTA_STATUS_KEY, undefined);
+		return;
+	}
+
+	if (rateLimited.isLimited) {
+		const reset = rateLimited.resetAt
+			? `reset ${fmtResetTime(rateLimited.resetAt)}`
+			: rateLimited.retryAfterSecs
+				? `retry in ${rateLimited.retryAfterSecs}s`
+				: "rate limited";
+		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg("error", `⛔ ${reset}`));
+		return;
+	}
+
+	const label = buildQuotaLabel(ctx);
+	if (label) ctx.ui.setStatus(QUOTA_STATUS_KEY, label);
+	checkQuotaAlerts(ctx);
+}
+
+// Session state
 interface SessionStats {
-	/** Finish reason from last completed assistant message. */
 	finishReason: string | null;
-	/** Prompt tokens used in last turn (from usage). */
 	contextUsed: number | null;
-	/** Model context window size. */
 	contextWindow: number | null;
 }
-
-const quota: QuotaState = {
-	isLimited: false,
-	resetAt: null,
-	retryAfterSecs: null,
-	dollarSpend: null,
-	dollarBudget: null,
-	tokenLimit: null,
-	rpmLimit: null,
-	lastNotifiedPct: null,
-	tokenUsageWindow: [],
-	requestWindow: 0,
-	requestWindowStart: 0,
-};
-
-const session: SessionStats = {
-	finishReason: null,
-	contextUsed: null,
-	contextWindow: null,
-};
+const session: SessionStats = { finishReason: null, contextUsed: null, contextWindow: null };
 
 const QUOTA_STATUS_KEY  = "openai-compat-quota";
 const SESSION_STATUS_KEY = "openai-compat-session";
 const TTFT_STATUS_KEY    = "openai-compat-ttft";
 
-// Finish reason display: icon + label + colour
 const FINISH_REASON_MAP: Record<string, { icon: string; label: string; color: string }> = {
-	end_turn:      { icon: "⏹",  label: "done",       color: "dim" },
-	stop:          { icon: "⏹",  label: "done",       color: "dim" },
-	stop_sequence: { icon: "⏹",  label: "stop_seq",   color: "dim" },
-	max_tokens:    { icon: "✂",  label: "max_tokens", color: "warning" },
-	length:        { icon: "✂",  label: "max_tokens", color: "warning" },
-	tool_use:      { icon: "🔧", label: "tool",       color: "dim" },
-	tool_calls:    { icon: "🔧", label: "tool",       color: "dim" },
-	error:         { icon: "⚠",  label: "error",      color: "error" },
+	end_turn: { icon: "⏹", label: "done", color: "dim" },
+	stop:     { icon: "⏹", label: "done", color: "dim" },
+	stop_sequence: { icon: "⏹", label: "stop_seq", color: "dim" },
+	max_tokens: { icon: "✂", label: "max_tokens", color: "warning" },
+	length:     { icon: "✂", label: "max_tokens", color: "warning" },
+	tool_use:   { icon: "🔧", label: "tool", color: "dim" },
+	tool_calls: { icon: "🔧", label: "tool", color: "dim" },
+	error:      { icon: "⚠", label: "error", color: "error" },
 };
 
 function fmtTokens(n: number): string {
@@ -293,129 +284,9 @@ function fmtTokens(n: number): string {
 	return String(n);
 }
 
-function fmtDollars(n: number): string {
-	if (n >= 1000) return `$${(n / 1000).toFixed(1)}K`;
-	if (n >= 1) return `$${n.toFixed(2)}`;
-	return `$${n.toFixed(4)}`;
-}
-
 function fmtResetTime(resetAt: string): string {
-	// "2026-05-13 00:57:30 UTC" → "00:57 UTC"
 	const m = resetAt.match(/(\d{2}:\d{2}):\d{2} (UTC)/i);
 	return m ? `${m[1]} ${m[2]}` : resetAt;
-}
-
-// -------------------------------------------------------------------------
-// Sliding-window RPM/TPM tracking
-//
-// LiteLLM MaaS doesn't send rate-limit headers on streaming responses,
-// so we track usage locally using a 60-second sliding window.
-// -------------------------------------------------------------------------
-
-const TRACKING_WINDOW_MS = 60_000;
-
-function trackRequest(tokenCount: number): void {
-	const now = Date.now();
-
-	// Reset request window every 60s
-	if (now - quota.requestWindowStart >= TRACKING_WINDOW_MS) {
-		quota.requestWindow = 0;
-		quota.requestWindowStart = now;
-	}
-	quota.requestWindow++;
-
-	// Add to token usage window
-	quota.tokenUsageWindow.push({ timestamp: now, totalTokens: tokenCount });
-
-	// Prune expired entries (>60s old)
-	const cutoff = now - TRACKING_WINDOW_MS;
-	quota.tokenUsageWindow = quota.tokenUsageWindow.filter((e) => e.timestamp >= cutoff);
-}
-
-function getRollingTPM(): number {
-	const now = Date.now();
-	const cutoff = now - TRACKING_WINDOW_MS;
-	return quota.tokenUsageWindow
-		.filter((e) => e.timestamp >= cutoff)
-		.reduce((sum, e) => sum + e.totalTokens, 0);
-}
-
-function getRollingRPM(): number {
-	const now = Date.now();
-	const cutoff = now - TRACKING_WINDOW_MS;
-	// Count distinct requests whose window start falls within the last 60s
-	return quota.requestWindow;
-}
-
-function rpmWindowReset(): void {
-	const now = Date.now();
-	if (now - quota.requestWindowStart >= TRACKING_WINDOW_MS) {
-		quota.requestWindow = 0;
-		quota.requestWindowStart = now;
-	}
-}
-
-function updateQuotaStatus(ctx: ExtensionContext): void {
-	if (ctx.model?.provider !== PROVIDER_NAME) {
-		ctx.ui.setStatus(QUOTA_STATUS_KEY, undefined);
-		return;
-	}
-
-	if (quota.isLimited) {
-		const reset = quota.resetAt
-			? `reset ${fmtResetTime(quota.resetAt)}`
-			: quota.retryAfterSecs
-				? `retry in ${quota.retryAfterSecs}s`
-				: "rate limited";
-		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg("error", `⛔ ${reset}`));
-		return;
-	}
-
-	const rpm = getRollingRPM();
-	const tpm = getRollingTPM();
-	const rpmOk = quota.rpmLimit !== null && rpm < quota.rpmLimit;
-	const tpmOk = quota.tokenLimit !== null && tpm < quota.tokenLimit;
-
-	// Show RPM/TPM usage if we have rate-limit data; fall back to dollar spend.
-	if (rpmOk || tpmOk) {
-		const parts: string[] = [];
-
-		// RPM: color by proximity to limit
-		if (quota.rpmLimit !== null) {
-			const rpmPct = rpm / quota.rpmLimit;
-			const rpmColor = rpmPct > 0.85 ? "error" : rpmPct > 0.65 ? "warning" : "dim";
-			parts.push(ctx.ui.theme.fg(rpmColor as ThemeColor, `rps:${rpm}/${quota.rpmLimit}`));
-		}
-
-		// TPM: color by proximity to limit
-		if (quota.tokenLimit !== null) {
-			const tpmPct = tpm / quota.tokenLimit;
-			const tpmColor = tpmPct > 0.85 ? "error" : tpmPct > 0.65 ? "warning" : "dim";
-			parts.push(ctx.ui.theme.fg(tpmColor as ThemeColor, `${fmtTokens(tpm)}/${fmtTokens(quota.tokenLimit)} tpm`));
-		}
-
-		// Notifications for RPM approaching limit
-		if (quota.rpmLimit !== null) {
-			const rpmPct = rpm / quota.rpmLimit;
-			const crossed85 = rpmPct > 0.85 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct < 0.85);
-			if (crossed85) {
-				quota.lastNotifiedPct = rpmPct;
-				ctx.ui.notify(`⚠️ RPM approaching limit: ${rpm}/${quota.rpmLimit} requests/min (${Math.round(rpmPct * 100)}%). Slow down to avoid being cut off.`, "warning");
-			}
-		}
-
-		ctx.ui.setStatus(QUOTA_STATUS_KEY, parts.join(ctx.ui.theme.fg("dim", "  ")));
-		return;
-	}
-
-	// No rate-limit data — fall back to dollar spend display
-	if (quota.dollarBudget !== null && quota.dollarSpend !== null && quota.dollarBudget > 0) {
-		const pct = quota.dollarSpend / quota.dollarBudget;
-		const color = (pct > 0.90 ? "error" : pct > 0.75 ? "warning" : "dim") as ThemeColor;
-		const label = `${fmtDollars(quota.dollarSpend)}/${fmtDollars(quota.dollarBudget)} ${Math.round(pct * 100)}%`;
-		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg(color, label));
-		return;
-	}
 }
 
 function updateSessionStatus(ctx: ExtensionContext): void {
@@ -423,33 +294,16 @@ function updateSessionStatus(ctx: ExtensionContext): void {
 		ctx.ui.setStatus(SESSION_STATUS_KEY, undefined);
 		return;
 	}
-
 	const parts: string[] = [];
-
-	// Context usage: e.g. "42K/131K ctx"
 	if (session.contextUsed !== null && session.contextWindow !== null && session.contextWindow > 0) {
-		const pct = session.contextUsed / session.contextWindow;
-		const color = pct > 0.85 ? "error" : pct > 0.65 ? "warning" : "dim";
-		parts.push(ctx.ui.theme.fg(color,
-			`${fmtTokens(session.contextUsed)}/${fmtTokens(session.contextWindow)} ctx`
-		));
+		const color = session.contextUsed / session.contextWindow > 0.85 ? "error" : session.contextUsed / session.contextWindow > 0.65 ? "warning" : "dim";
+		parts.push(ctx.ui.theme.fg(color, `${fmtTokens(session.contextUsed)}/${fmtTokens(session.contextWindow)} ctx`));
 	}
-
-	// Finish reason: e.g. "✂ max_tokens" or "⏹ done"
 	if (session.finishReason) {
-		const def = FINISH_REASON_MAP[session.finishReason] ?? {
-			icon: "?", label: session.finishReason, color: "dim",
-		};
+		const def = FINISH_REASON_MAP[session.finishReason] ?? { icon: "?", label: session.finishReason, color: "dim" };
 		parts.push(ctx.ui.theme.fg(def.color as ThemeColor, `${def.icon} ${def.label}`));
 	}
-
-	if (parts.length > 0) {
-		ctx.ui.setStatus(SESSION_STATUS_KEY,
-			parts.join(ctx.ui.theme.fg("dim", "  "))
-		);
-	} else {
-		ctx.ui.setStatus(SESSION_STATUS_KEY, undefined);
-	}
+	ctx.ui.setStatus(SESSION_STATUS_KEY, parts.length > 0 ? parts.join(ctx.ui.theme.fg("dim", "  ")) : undefined);
 }
 
 function resetSessionStats(): void {
@@ -460,83 +314,54 @@ function resetSessionStats(): void {
 
 // ---------------------------------------------------------------------------
 // TTFT (time-to-first-token) waiting indicator
-//
-// With LiteMaaS + Qwen3, the model reasons inside <think>...</think> tags
-// that LiteLLM strips mid-stream. From Pi's perspective the connection is
-// open but silent — no SSE chunks arrive until thinking is complete.
-// This produces the "model stalled" appearance with no observable signal.
-//
-// Fix: start a setInterval on before_provider_request that updates a status
-// slot every second with elapsed time. First message_update stops the timer
-// and shows the TTFT. The elapsed counter proves Pi is alive and waiting;
-// the TTFT metric is a proxy for how long the model reasoned.
 // ---------------------------------------------------------------------------
 
 interface WaitState {
-	/** Timestamp when before_provider_request fired for this turn. */
 	requestSentAt: number | null;
-	/** Timestamp when the first message_update token arrived. */
 	firstTokenAt: number | null;
-	/** True once the first token has been received this turn. */
 	gotFirstToken: boolean;
-	/** Active setInterval handle. */
 	timer: ReturnType<typeof setInterval> | null;
-	/** Captured ctx.ui reference for use inside the interval callback. */
 	ui: ExtensionContext["ui"] | null;
 }
-
-const wait: WaitState = {
-	requestSentAt: null,
-	firstTokenAt: null,
-	gotFirstToken: false,
-	timer: null,
-	ui: null,
-};
+const wait: WaitState = { requestSentAt: null, firstTokenAt: null, gotFirstToken: false, timer: null, ui: null };
 
 function clearWaitTimer(): void {
-	if (wait.timer !== null) {
-		clearInterval(wait.timer);
-		wait.timer = null;
-	}
+	if (wait.timer !== null) { clearInterval(wait.timer); wait.timer = null; }
 }
 
 function tickWaitStatus(): void {
 	if (!wait.ui || !wait.requestSentAt || wait.gotFirstToken) return;
-	const elapsed = Math.round((Date.now() - wait.requestSentAt) / 1000);
-	wait.ui.setStatus(TTFT_STATUS_KEY, wait.ui.theme.fg("warning", `⏳ ${elapsed}s`));
+	wait.ui.setStatus(TTFT_STATUS_KEY, wait.ui.theme.fg("warning", `⏳ ${Math.round((Date.now() - wait.requestSentAt) / 1000)}s`));
 }
 
 function resetWaitState(ctx: ExtensionContext): void {
 	clearWaitTimer();
 	wait.requestSentAt = null;
-	wait.firstTokenAt  = null;
+	wait.firstTokenAt = null;
 	wait.gotFirstToken = false;
-	wait.ui            = null;
+	wait.ui = null;
 	ctx.ui.setStatus(TTFT_STATUS_KEY, undefined);
 }
+
+// ---------------------------------------------------------------------------
+// Extension registration
+// ---------------------------------------------------------------------------
 
 export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<void> {
 	const baseUrl = resolveBaseUrl();
 	const apiKey = resolveApiKey();
-
-	if (!baseUrl) {
-		// No endpoint configured — silently skip registration.
-		return;
-	}
+	if (!baseUrl) return;
 
 	let models: ProviderModelConfig[];
 	try {
-		const entries = await discoverModels(baseUrl, apiKey ?? "no-key");
-		models = entries.map(toProviderModel);
+		models = (await discoverModels(baseUrl, apiKey ?? "no-key")).map(toProviderModel);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		console.error(`[pi-openai-compat] Failed to discover models from ${baseUrl}: ${msg}`);
-		console.error("[pi-openai-compat] Provider will not be registered.");
 		return;
 	}
-
 	if (models.length === 0) {
-		console.error(`[pi-openai-compat] No models found at ${baseUrl}. Provider will not be registered.`);
+		console.error(`[pi-openai-compat] No models found at ${baseUrl}`);
 		return;
 	}
 
@@ -548,209 +373,103 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 		models,
 	});
 
-	// Poll /user/info at load time (not in a handler) because session_start may
-	// have already fired before this handler is registered.
-	// LiteLLM MaaS nests quota under user_info (not top-level).
-	{
+	// Poll /user/info at load time for RPM/TPM limits.
+	try {
 		const infoUrl = baseUrl.replace(/\/v1\/?$/, "") + "/user/info";
-		try {
-			const headers: Record<string, string> = {
-				"Content-Type": "application/json",
-			};
-			if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-
-			const resp = await fetch(infoUrl, { headers });
-			if (resp.ok) {
-				const data = await resp.json() as {
-					user_info?: {
-						spend?: number | null;
-						max_budget?: number | null;
-						tpm_limit?: number | null;
-						rpm_limit?: number | null;
-					};
-					keys?: Array<{
-						spend?: number | null;
-						max_budget?: number | null;
-						tpm_limit?: number | null;
-						models?: string[];
-					}>;
-				};
-
-				// LiteLLM MaaS nests spend/budget under user_info
-				const ui = data.user_info;
-				if (ui) {
-					quota.dollarSpend = ui.spend ?? 0;
-					quota.dollarBudget = ui.max_budget;
-					quota.tokenLimit = ui.tpm_limit;
-					quota.rpmLimit = ui.rpm_limit;
-				} else if (data.keys?.[0]) {
-					// Fallback: key-level spend if user_info not present
-					const k = data.keys[0];
-					quota.dollarSpend = k.spend ?? 0;
-					quota.dollarBudget = k.max_budget;
-					quota.tokenLimit = k.tpm_limit;
-				}
-			
-			}
-		} catch (err) {
-			console.error(`[pi-openai-compat] /user/info failed:`, err);
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// Quota monitoring — 429 detection + periodic spend refresh + RPM/TPM
-	// -------------------------------------------------------------------------
-
-	// Periodically refresh spend data so the status bar stays current.
-	// Poll every 30s during active use.
-	let lastSpendPoll = 0;
-	const SPEND_POLL_INTERVAL_MS = 30_000;
-
-	function pollSpend(ctx: ExtensionContext): void {
-		const now = Date.now();
-		if (now - lastSpendPoll < SPEND_POLL_INTERVAL_MS) return;
-		lastSpendPoll = now;
-
-		const infoUrl = baseUrl.replace(/\/v1\/?$/, "") + "/user/info";
-		fetch(infoUrl, {
+		const resp = await fetch(infoUrl, {
 			headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
-		}).then(async (resp) => {
-			if (!resp.ok) return;
-			const data = await resp.json() as {
-				user_info?: { spend?: number | null; max_budget?: number | null; tpm_limit?: number | null };
-				keys?: Array<{ spend?: number | null; max_budget?: number | null; tpm_limit?: number | null }>;
-			};
+		});
+		if (resp.ok) {
+			const data = await resp.json() as { user_info?: { tpm_limit?: number | null; rpm_limit?: number | null } };
 			const ui = data.user_info;
 			if (ui) {
-				quota.dollarSpend = ui.spend ?? 0;
-				quota.dollarBudget = ui.max_budget;
 				quota.tokenLimit = ui.tpm_limit;
-			} else if (data.keys?.[0]) {
-				const k = data.keys[0];
-				quota.dollarSpend = k.spend ?? 0;
-				quota.dollarBudget = k.max_budget;
-				quota.tokenLimit = k.tpm_limit;
+				quota.rpmLimit = ui.rpm_limit;
 			}
-			updateQuotaStatus(ctx);
-		}).catch(() => {});
+		}
+	} catch (err) {
+		console.error(`[pi-openai-compat] /user/info failed:`, err);
 	}
 
+	// RPM tracking — increment on request start so status bar is accurate.
+	pi.on("before_provider_request", (_event, _ctx) => {
+		trackRequestStart();
+	});
+
+	// 429 monitoring.
 	pi.on("after_provider_response", (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_NAME) return;
-
 		if (event.status === 429) {
-			quota.isLimited = true;
-			quota.lastNotifiedPct = 0;
-			const h = event.headers;
-			const retryRaw = h["retry-after"];
-			quota.retryAfterSecs = retryRaw ? parseInt(retryRaw, 10) : null;
-			if (quota.retryAfterSecs !== null) {
-				const resetDate = new Date(Date.now() + quota.retryAfterSecs * 1000);
-				quota.resetAt = resetDate.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
-			} else {
-				quota.resetAt = null;
+			rateLimited.isLimited = true;
+			lastNotifiedPct = 0;
+			const retryRaw = event.headers["retry-after"];
+			rateLimited.retryAfterSecs = retryRaw ? parseInt(retryRaw, 10) : null;
+			if (rateLimited.retryAfterSecs !== null) {
+				const resetDate = new Date(Date.now() + rateLimited.retryAfterSecs * 1000);
+				rateLimited.resetAt = resetDate.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
 			}
-			const resetMsg = quota.resetAt ? ` Resets at ${fmtResetTime(quota.resetAt)}.` : "";
-			ctx.ui.notify(`⛔ Token quota exhausted.${resetMsg} Switch to a different model or wait for reset.`, "error");
+			ctx.ui.notify(`⛔ Token quota exhausted.${rateLimited.resetAt ? ` Resets at ${fmtResetTime(rateLimited.resetAt)}.` : ""} Switch to a different model or wait for reset.`, "error");
 		} else if (event.status === 200) {
-			quota.isLimited = false;
-			quota.resetAt = null;
-			quota.retryAfterSecs = null;
-			quota.lastNotifiedPct = null;
+			rateLimited.isLimited = false;
+			rateLimited.resetAt = null;
+			rateLimited.retryAfterSecs = null;
+			lastNotifiedPct = null;
 		}
-
-		// Periodically refresh spend data
-		pollSpend(ctx);
 		updateQuotaStatus(ctx);
 	});
 
-	// -------------------------------------------------------------------------
-	// Session stats — finish reason + context usage → session status slot
-	// -------------------------------------------------------------------------
-
+	// Session stats + token tracking.
 	pi.on("message_end", async (event, ctx) => {
-		if (ctx.model?.provider !== PROVIDER_NAME) return;
-		if (event.message.role !== "assistant") return;
-
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const msg = event.message as any;
-
-		// Finish reason — Pi maps OpenAI finish_reason to Anthropic stop_reason internally
-		const reason = msg.stop_reason ?? msg.stopReason ?? msg.finish_reason ?? null;
+		if (ctx.model?.provider !== PROVIDER_NAME || event.message.role !== "assistant") return;
+		const msg = event.message as Record<string, unknown>;
+		const reason = msg.stop_reason ?? msg.stopReason ?? msg.finish_reason;
 		if (reason) session.finishReason = String(reason);
-
-		// Context usage — populated by Pi when supportsUsageInStreaming is true
 		const usage = ctx.getContextUsage();
 		if (usage?.tokens) {
 			session.contextUsed = usage.tokens;
 			session.contextWindow = ctx.model?.contextWindow ?? null;
-			// Track for RPM/TPM sliding window
-			trackRequest(usage.tokens);
+			trackTokens(usage.tokens);
 		}
-
 		updateSessionStatus(ctx);
 	});
 
-	// -------------------------------------------------------------------------
-	// TTFT waiting indicator — turn_start / before_provider_request / message_update
-	// -------------------------------------------------------------------------
-
-	// Reset per-turn state before each LLM turn.
+	// TTFT indicators.
 	pi.on("turn_start", (_event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_NAME) return;
 		resetWaitState(ctx);
 	});
-
-	// Request dispatched — start the elapsed-time ticker.
 	pi.on("before_provider_request", (_event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_NAME) return;
 		wait.requestSentAt = Date.now();
-		wait.ui            = ctx.ui;
+		wait.ui = ctx.ui;
 		clearWaitTimer();
-		tickWaitStatus();  // show immediately rather than waiting for first tick
+		tickWaitStatus();
 		wait.timer = setInterval(tickWaitStatus, 1000);
 	});
-
-	// First token arrived — stop ticker, show TTFT, then dim after 5s.
 	pi.on("message_update", (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_NAME) return;
 		if ((event.message as { role?: string }).role !== "assistant") return;
 		if (wait.gotFirstToken) return;
-
 		wait.gotFirstToken = true;
-		wait.firstTokenAt  = Date.now();
+		wait.firstTokenAt = Date.now();
 		clearWaitTimer();
-
 		if (wait.requestSentAt && wait.firstTokenAt) {
 			const ttft = ((wait.firstTokenAt - wait.requestSentAt) / 1000).toFixed(1);
 			ctx.ui.setStatus(TTFT_STATUS_KEY, ctx.ui.theme.fg("dim", `⚡ ${ttft}s`));
 		}
 	});
-
-	// Safety net: if the turn ends without any tokens (abort / error), clear.
 	pi.on("turn_end", (_event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_NAME) return;
 		clearWaitTimer();
-		if (!wait.gotFirstToken) {
-			ctx.ui.setStatus(TTFT_STATUS_KEY, undefined);
-		}
+		if (!wait.gotFirstToken) ctx.ui.setStatus(TTFT_STATUS_KEY, undefined);
 	});
 
-	// -------------------------------------------------------------------------
-	// Shared lifecycle hooks
-	// -------------------------------------------------------------------------
-
-	// Track RPM per turn — increment on turn_start (first request of this turn).
-	pi.on("before_provider_request", (_event, _ctx) => {
-		rpmWindowReset();
-	});
-
+	// Shared lifecycle.
 	pi.on("model_select", (_event, ctx) => {
 		updateQuotaStatus(ctx);
 		updateSessionStatus(ctx);
 		resetWaitState(ctx);
 	});
-
 	pi.on("session_start", async (_event, ctx) => {
 		resetSessionStats();
 		resetWaitState(ctx);
