@@ -1,3 +1,10 @@
+import {
+	appendFileSync,
+	mkdirSync,
+	existsSync,
+} from "node:fs";
+import { join, dirname } from "node:path";
+
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -265,6 +272,21 @@ interface SessionStats {
 }
 const session: SessionStats = { finishReason: null, contextUsed: null, contextWindow: null };
 
+const logDir = "~/.pi/logs/pi-openai-compat";
+const logFile = "session-log.jsonl";
+
+function logEvent(ctx: ExtensionContext, evt: { ts: string; event: string; details: Record<string, unknown> }): void {
+	try {
+		const path = join(ctx.cwd, logDir, logFile);
+		if (!existsSync(dirname(path))) {
+			mkdirSync(dirname(path), { recursive: true });
+		}
+		appendFileSync(path, JSON.stringify(evt) + "\n", "utf8");
+	} catch {
+		/* best-effort only — never interrupt the model loop */
+	}
+}
+
 const QUOTA_STATUS_KEY  = "openai-compat-quota";
 const SESSION_STATUS_KEY = "openai-compat-session";
 const TTFT_STATUS_KEY    = "openai-compat-ttft";
@@ -419,6 +441,7 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 		if (ctx.model?.provider !== PROVIDER_NAME) return;
 		if (event.status === 429) {
 			rateLimited.isLimited = true;
+			logEvent(ctx, { ts: new Date().toISOString(), event: "429", details: { tpm: getRollingTPM(), rpm: getRollingRPM() } });
 			lastNotifiedPct = 0;
 			const retryRaw = event.headers["retry-after"];
 			rateLimited.retryAfterSecs = retryRaw ? parseInt(retryRaw, 10) : null;
@@ -441,8 +464,11 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 		if (ctx.model?.provider !== PROVIDER_NAME || event.message.role !== "assistant") return;
 		const msg = event.message as unknown as Record<string, unknown>;
 		const reason = msg.stop_reason ?? msg.stopReason ?? msg.finish_reason;
-		if (reason) session.finishReason = String(reason);
 		const usage = ctx.getContextUsage();
+		if (reason) session.finishReason = String(reason);
+		if (reason && reason !== "end_turn" && reason !== "stop" && reason !== "stop_sequence") {
+			logEvent(ctx, { ts: new Date().toISOString(), event: "finish", details: { reason, tokens: usage?.tokens } });
+		}
 		if (usage?.tokens) {
 			session.contextUsed = usage.tokens;
 			session.contextWindow = ctx.model?.contextWindow ?? null;
