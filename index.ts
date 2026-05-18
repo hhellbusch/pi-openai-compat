@@ -233,6 +233,7 @@ interface QuotaRateLimited {
 const rateLimited: QuotaRateLimited = { isLimited: false, resetAt: null, retryAfterSecs: null };
 const quota: QuotaLimits = { tokenLimit: null, rpmLimit: null };
 let lastNotifiedPct: number | null = null;
+let lastContextNotifiedPct: number | null = null;
 
 function updateQuotaStatus(ctx: ExtensionContext): void {
 	if (ctx.model?.provider !== PROVIDER_NAME) {
@@ -429,6 +430,22 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 			session.contextUsed = usage.tokens;
 			session.contextWindow = ctx.model?.contextWindow ?? null;
 			trackTokens(usage.tokens);
+
+			// Warn when context crosses thresholds — suggest compacting.
+			const ctxPct = session.contextWindow && session.contextWindow > 0
+				? usage.tokens / session.contextWindow
+				: null;
+			if (ctxPct !== null) {
+				const crossed75 = ctxPct >= 0.75 && (lastContextNotifiedPct === null || lastContextNotifiedPct < 0.75);
+				const crossed40 = ctxPct >= 0.40 && (lastContextNotifiedPct === null || lastContextNotifiedPct < 0.40);
+				if (crossed75) {
+					lastContextNotifiedPct = ctxPct;
+					ctx.ui.notify(`⚠️ Context at ${Math.round(ctxPct * 100)}% — compact soon to avoid hitting the limit mid-turn.`, "warning");
+				} else if (crossed40) {
+					lastContextNotifiedPct = ctxPct;
+					ctx.ui.notify(`💡 Context at ${Math.round(ctxPct * 100)}% — consider compacting to keep token costs low.`, "info");
+				}
+			}
 		}
 		updateSessionStatus(ctx);
 	});
@@ -473,6 +490,7 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 	pi.on("session_start", async (_event, ctx) => {
 		resetSessionStats();
 		resetWaitState(ctx);
+		lastContextNotifiedPct = null;
 		updateQuotaStatus(ctx);
 		updateSessionStatus(ctx);
 	});
