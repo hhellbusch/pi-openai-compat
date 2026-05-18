@@ -212,6 +212,11 @@ function toProviderModel(entry: OpenAIModelEntry): ProviderModelConfig {
 // Footer state — quota + session stats shown in Pi status bar
 // ---------------------------------------------------------------------------
 
+interface UsageEntry {
+	timestamp: number;
+	totalTokens: number;
+}
+
 interface QuotaState {
 	/** True when a 429 has been received and not yet cleared by a 200. */
 	isLimited: boolean;
@@ -225,8 +230,16 @@ interface QuotaState {
 	dollarBudget: number | null;
 	/** Token limit (tpm_limit) from LiteLLM /user/info. */
 	tokenLimit: number | null;
+	/** Request-per-minute limit (rpm_limit) from LiteLLM /user/info. */
+	rpmLimit: number | null;
 	/** Last pct at which a threshold notification was sent (avoids repeat spam). */
 	lastNotifiedPct: number | null;
+	/** Sliding window: token usage entries per 60s window. */
+	tokenUsageWindow: UsageEntry[];
+	/** Sliding window: request count per 60s window. */
+	requestWindow: number;
+	/** Window start time for requests. */
+	requestWindowStart: number;
 }
 
 interface SessionStats {
@@ -245,7 +258,11 @@ const quota: QuotaState = {
 	dollarSpend: null,
 	dollarBudget: null,
 	tokenLimit: null,
+	rpmLimit: null,
 	lastNotifiedPct: null,
+	tokenUsageWindow: [],
+	requestWindow: 0,
+	requestWindowStart: 0,
 };
 
 const session: SessionStats = {
@@ -304,24 +321,49 @@ function updateQuotaStatus(ctx: ExtensionContext): void {
 		return;
 	}
 
+	const rpm = getRollingRPM();
+	const tpm = getRollingTPM();
+	const rpmOk = quota.rpmLimit !== null && rpm < quota.rpmLimit;
+	const tpmOk = quota.tokenLimit !== null && tpm < quota.tokenLimit;
+
+	// Show RPM/TPM usage if we have rate-limit data; fall back to dollar spend.
+	if (rpmOk || tpmOk) {
+		const parts: string[] = [];
+
+		// RPM: color by proximity to limit
+		if (quota.rpmLimit !== null) {
+			const rpmPct = rpm / quota.rpmLimit;
+			const rpmColor = rpmPct > 0.85 ? "error" : rpmPct > 0.65 ? "warning" : "dim";
+			parts.push(ctx.ui.theme.fg(rpmColor as ThemeColor, `rps:${rpm}/${quota.rpmLimit}`));
+		}
+
+		// TPM: color by proximity to limit
+		if (quota.tokenLimit !== null) {
+			const tpmPct = tpm / quota.tokenLimit;
+			const tpmColor = tpmPct > 0.85 ? "error" : tpmPct > 0.65 ? "warning" : "dim";
+			parts.push(ctx.ui.theme.fg(tpmColor as ThemeColor, `${fmtTokens(tpm)}/${fmtTokens(quota.tokenLimit)} tpm`));
+		}
+
+		// Notifications for RPM approaching limit
+		if (quota.rpmLimit !== null) {
+			const rpmPct = rpm / quota.rpmLimit;
+			const crossed85 = rpmPct > 0.85 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct < 0.85);
+			if (crossed85) {
+				quota.lastNotifiedPct = rpmPct;
+				ctx.ui.notify(`⚠️ RPM approaching limit: ${rpm}/${quota.rpmLimit} requests/min (${Math.round(rpmPct * 100)}%). Slow down to avoid being cut off.`, "warning");
+			}
+		}
+
+		ctx.ui.setStatus(QUOTA_STATUS_KEY, parts.join(ctx.ui.theme.fg("dim", "  ")));
+		return;
+	}
+
+	// No rate-limit data — fall back to dollar spend display
 	if (quota.dollarBudget !== null && quota.dollarSpend !== null && quota.dollarBudget > 0) {
 		const pct = quota.dollarSpend / quota.dollarBudget;
 		const color = (pct > 0.90 ? "error" : pct > 0.75 ? "warning" : "dim") as ThemeColor;
 		const label = `${fmtDollars(quota.dollarSpend)}/${fmtDollars(quota.dollarBudget)} ${Math.round(pct * 100)}%`;
 		ctx.ui.setStatus(QUOTA_STATUS_KEY, ctx.ui.theme.fg(color, label));
-
-		// Fire a notification when crossing warning/error thresholds.
-		// Only notify once per threshold crossing to avoid spam.
-		const crossed75 = pct > 0.75 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct <= 0.75);
-		const crossed90 = pct > 0.90 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct <= 0.90);
-
-		if (crossed90) {
-			quota.lastNotifiedPct = pct;
-			ctx.ui.notify(`⚠️ Budget critical: $${quota.dollarSpend.toFixed(2)} of $${quota.dollarBudget.toFixed(2)} used (${Math.round(pct * 100)}%). Save your work.`, "error");
-		} else if (crossed75) {
-			quota.lastNotifiedPct = pct;
-			ctx.ui.notify(`Budget at ${Math.round(pct * 100)}%: $${quota.dollarSpend.toFixed(2)} of $${quota.dollarBudget.toFixed(2)} used.`, "warning");
-		}
 		return;
 	}
 }
@@ -505,11 +547,58 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 	}
 
 	// -------------------------------------------------------------------------
-	// Quota monitoring — 429 detection + periodic spend refresh
+	// Sliding-window RPM/TPM tracking
 	//
 	// LiteLLM MaaS doesn't send rate-limit headers on streaming responses,
-	// so we track 429s directly and poll /user/info periodically for fresh
-	// dollar-spend data.
+	// so we track usage locally using a 60-second sliding window. This gives
+	// real-time visibility into how close you are to hitting RPM/TPM limits.
+	// -------------------------------------------------------------------------
+
+	const WINDOW_MS = 60_000;
+
+	function trackRequest(tokenCount: number): void {
+		const now = Date.now();
+
+		// Reset request window every 60s
+		if (now - quota.requestWindowStart >= WINDOW_MS) {
+			quota.requestWindow = 0;
+			quota.requestWindowStart = now;
+		}
+		quota.requestWindow++;
+
+		// Add to token usage window
+		quota.tokenUsageWindow.push({ timestamp: now, totalTokens: tokenCount });
+
+		// Prune expired entries (>60s old)
+		const cutoff = now - WINDOW_MS;
+		quota.tokenUsageWindow = quota.tokenUsageWindow.filter((e) => e.timestamp >= cutoff);
+	}
+
+	function getRollingTPM(): number {
+		const now = Date.now();
+		const cutoff = now - WINDOW_MS;
+		return quota.tokenUsageWindow
+			.filter((e) => e.timestamp >= cutoff)
+			.reduce((sum, e) => sum + e.totalTokens, 0);
+	}
+
+	function getRollingRPM(): number {
+		const now = Date.now();
+		const cutoff = now - WINDOW_MS;
+		// Count distinct requests whose window start falls within the last 60s
+		return quota.requestWindow;
+	}
+
+	function rpmWindowReset(): void {
+		const now = Date.now();
+		if (now - quota.requestWindowStart >= WINDOW_MS) {
+			quota.requestWindow = 0;
+			quota.requestWindowStart = now;
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Quota monitoring — 429 detection + periodic spend refresh + RPM/TPM
 	// -------------------------------------------------------------------------
 
 	// Periodically refresh spend data so the status bar stays current.
@@ -595,6 +684,8 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 		if (usage?.tokens) {
 			session.contextUsed = usage.tokens;
 			session.contextWindow = ctx.model?.contextWindow ?? null;
+			// Track for RPM/TPM sliding window
+			trackRequest(usage.tokens);
 		}
 
 		updateSessionStatus(ctx);
@@ -648,6 +739,11 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 	// -------------------------------------------------------------------------
 	// Shared lifecycle hooks
 	// -------------------------------------------------------------------------
+
+	// Track RPM per turn — increment on turn_start (first request of this turn).
+	pi.on("before_provider_request", (_event, _ctx) => {
+		rpmWindowReset();
+	});
 
 	pi.on("model_select", (_event, ctx) => {
 		updateQuotaStatus(ctx);
