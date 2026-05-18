@@ -470,6 +470,12 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 			if (!resp.ok) return;
 
 			const data = await resp.json() as {
+				// Top-level user info (LiteLLM returns quota here)
+				tpm_limit?: number | null;
+				rpm_limit?: number | null;
+				spend?: number | null;
+				max_budget?: number | null;
+				// Key-level info (some LiteLLM setups nest keys under .keys)
 				keys?: Array<{
 					token_budget_duration?: string | null;
 					max_budget?: number | null;
@@ -477,6 +483,7 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 					tpm_limit?: number | null;
 					rpm_limit?: number | null;
 				}>;
+				// Team-level info (some LiteLLM setups nest under .teams)
 				teams?: Array<{
 					tpm_limit?: number | null;
 					max_budget?: number | null;
@@ -484,15 +491,15 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 				}>;
 			};
 
-			// Prefer team-level TPM limit (reflects the per-user token quota)
-			// Fall back to key-level limits if present
-			const team = data.teams?.[0];
+			// LiteLLM returns quota in three places depending on configuration:
+			// 1. Top level (this LiteLLM/MaaS setup): direct on user object
+			// 2. Under .keys[0] (key-based auth setups)
+			// 3. Under .teams[0] (team-based setups)
+			// Prefer top-level, then key-level, then team-level.
+			const topLevel = data as { tpm_limit?: number | null };
 			const key = data.keys?.[0];
-
-			// LiteLLM tracks spend in dollars; the 429 error says "Limit type: tokens"
-			// meaning the limit tracked here is token-based, not dollar-based.
-			// The X-Ratelimit-User-Limit-Tokens header (5000000) matches the user tpm_limit.
-			const tpmLimit = team?.tpm_limit ?? key?.tpm_limit ?? null;
+			const team = data.teams?.[0];
+			const tpmLimit = topLevel.tpm_limit ?? key?.tpm_limit ?? team?.tpm_limit ?? null;
 			if (tpmLimit !== null) {
 				quota.limit = tpmLimit;
 			}
