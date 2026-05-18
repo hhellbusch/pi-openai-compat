@@ -215,9 +215,9 @@ function checkQuotaAlerts(ctx: ExtensionContext): void {
 	if (quota.rpmLimit !== null) {
 		const rpm = getRollingRPM();
 		const rpmPct = rpm / quota.rpmLimit;
-		const crossed85 = rpmPct > 0.85 && (quota.lastNotifiedPct === null || quota.lastNotifiedPct < 0.85);
+		const crossed85 = rpmPct > 0.85 && (lastNotifiedPct === null || lastNotifiedPct < 0.85);
 		if (crossed85) {
-			quota.lastNotifiedPct = rpmPct;
+			lastNotifiedPct = rpmPct;
 			ctx.ui.notify(`⚠️ RPM approaching limit: ${rpm}/${quota.rpmLimit} requests/min (${Math.round(rpmPct * 100)}%). Slow down to avoid being cut off.`, "warning");
 		}
 	}
@@ -234,6 +234,7 @@ const rateLimited: QuotaRateLimited = { isLimited: false, resetAt: null, retryAf
 const quota: QuotaLimits = { tokenLimit: null, rpmLimit: null };
 let lastNotifiedPct: number | null = null;
 let lastContextNotifiedPct: number | null = null;
+let lastBudgetNotified: boolean = false; // pre-turn budget warning — fires once per session
 
 function updateQuotaStatus(ctx: ExtensionContext): void {
 	if (ctx.model?.provider !== PROVIDER_NAME) {
@@ -385,8 +386,8 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 			const data = await resp.json() as { user_info?: { tpm_limit?: number | null; rpm_limit?: number | null } };
 			const ui = data.user_info;
 			if (ui) {
-				quota.tokenLimit = ui.tpm_limit;
-				quota.rpmLimit = ui.rpm_limit;
+				quota.tokenLimit = ui.tpm_limit ?? null;
+				quota.rpmLimit = ui.rpm_limit ?? null;
 			}
 		}
 	} catch (err) {
@@ -394,8 +395,23 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 	}
 
 	// RPM tracking — increment on request start so status bar is accurate.
-	pi.on("before_provider_request", (_event, _ctx) => {
+	pi.on("before_provider_request", (_event, ctx) => {
 		trackRequestStart();
+
+		// Pre-turn budget check — warn if this request will likely hit the wall.
+		if (quota.tokenLimit !== null) {
+			const usage = ctx.getContextUsage();
+			const ctxTokens = usage?.tokens ?? 0;
+			const tpmUsed = getRollingTPM() + ctxTokens;
+			const budgetPct = tpmUsed / quota.tokenLimit;
+			if (budgetPct >= 0.9 && !lastBudgetNotified) {
+				lastBudgetNotified = true;
+				ctx.ui.notify(
+					`⚠️ Pre-turn budget warning: context (${fmtTokens(ctxTokens)}) + current TPM usage (${fmtTokens(getRollingTPM())}) = ${fmtTokens(tpmUsed)}/${fmtTokens(quota.tokenLimit)}. This request may be cut off by the TPM limit. Consider compacting context or waiting.`,
+					"warning"
+				);
+			}
+		}
 	});
 
 	// 429 monitoring.
@@ -423,7 +439,7 @@ export default async function registerOpenAICompat(pi: ExtensionAPI): Promise<vo
 	// Session stats + token tracking.
 	pi.on("message_end", async (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_NAME || event.message.role !== "assistant") return;
-		const msg = event.message as Record<string, unknown>;
+		const msg = event.message as unknown as Record<string, unknown>;
 		const reason = msg.stop_reason ?? msg.stopReason ?? msg.finish_reason;
 		if (reason) session.finishReason = String(reason);
 		const usage = ctx.getContextUsage();
